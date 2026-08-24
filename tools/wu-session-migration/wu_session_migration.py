@@ -278,7 +278,28 @@ PHASE4_RESULT_REQUIRED_KEYS = {
 
 # Tests replace this hook to inject deterministic failures without weakening production checks.
 FAULT_HOOK: Callable[[str, int], None] | None = None
-_TEST_STATE_ROOT: Path | None = None
+
+
+class _MigrationState:
+    __slots__ = ("_root",)
+
+    def __init__(self, root: Path):
+        object.__setattr__(self, "_root", root)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError("migration state is immutable")
+
+    @property
+    def root(self) -> Path:
+        return self._root
+
+    @property
+    def journal_path(self) -> Path:
+        return self.root / "transaction.json"
+
+    @property
+    def lock_path(self) -> Path:
+        return self.root / "cutover.lock"
 
 
 class MigrationError(ValueError):
@@ -326,15 +347,19 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    return _main(argv, _production_state())
+
+
+def _main(argv: Sequence[str] | None, state: _MigrationState) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
         if args.command == "validate-pre-pr-readback":
-            validate_pre_pr_readback(args.readback)
+            _validate_pre_pr_readback_in_state(args.readback, state)
             print(f"WU-SESSION-PRE-PR-READBACK: PASS; evidence={args.readback}")
             return 0
         if args.command in {"dry-run", "capture-evidence"}:
-            with _cutover_lock():
-                _recover_incomplete_transaction_locked()
+            with _cutover_lock(state):
+                _recover_incomplete_transaction_locked(state)
                 if args.command == "dry-run":
                     plan = build_plan(
                         args.inventory,
@@ -359,10 +384,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"WU-SESSION-PR-EVIDENCE: PASS; evidence={args.output}")
                 return 0
         if args.command == "apply":
-            apply_plan(args.plan)
+            _apply_plan_in_state(args.plan, state)
             print(f"WU-SESSION-MIGRATION-APPLY: PASS; plan={args.plan}")
             return 0
-        readback_path = apply_runtime_request(args.request, args.command)
+        readback_path = _apply_runtime_request_in_state(
+            args.request, args.command, state
+        )
         readback_suffix = f"; readback={readback_path}" if readback_path is not None else ""
         print(
             "WU-SESSION-RUNTIME-WRITE: PASS; "
@@ -556,12 +583,16 @@ def build_plan(
 
 
 def apply_plan(plan_path: Path) -> None:
-    with _cutover_lock():
-        _recover_incomplete_transaction_locked()
-        _apply_plan_locked(plan_path)
+    _apply_plan_in_state(plan_path, _production_state())
 
 
-def _apply_plan_locked(plan_path: Path) -> None:
+def _apply_plan_in_state(plan_path: Path, state: _MigrationState) -> None:
+    with _cutover_lock(state):
+        _recover_incomplete_transaction_locked(state)
+        _apply_plan_locked(plan_path, state)
+
+
+def _apply_plan_locked(plan_path: Path, state: _MigrationState) -> None:
     plan_raw = _safe_read_bytes(plan_path)
     plan = _decode_json(plan_raw, plan_path)
     _validate_plan_schema(plan)
@@ -589,6 +620,7 @@ def _apply_plan_locked(plan_path: Path) -> None:
     _verify_plan_inputs(plan)
     _validate_writes(plan["writes"], planning_roots)
     _execute_transaction(
+        state=state,
         plan_path=plan_path,
         plan_raw=plan_raw,
         operation="migration-apply",
@@ -603,11 +635,21 @@ def apply_runtime_request(
     request_path: Path,
     operation: str,
 ) -> Path | None:
+    return _apply_runtime_request_in_state(
+        request_path, operation, _production_state()
+    )
+
+
+def _apply_runtime_request_in_state(
+    request_path: Path,
+    operation: str,
+    state: _MigrationState,
+) -> Path | None:
     if operation not in RUNTIME_OPERATIONS:
         raise InputError(f"unsupported runtime operation: {operation}")
-    with _cutover_lock():
-        _recover_incomplete_transaction_locked()
-        return _apply_runtime_request_locked(request_path, operation)
+    with _cutover_lock(state):
+        _recover_incomplete_transaction_locked(state)
+        return _apply_runtime_request_locked(request_path, operation, state)
 
 
 def validate_pre_pr_readback(
@@ -615,15 +657,31 @@ def validate_pre_pr_readback(
     *,
     expected_manifest: Mapping[str, Any] | None = None,
 ) -> None:
-    with _cutover_lock():
-        _recover_incomplete_transaction_locked()
+    _validate_pre_pr_readback_in_state(
+        readback_path,
+        _production_state(),
+        expected_manifest=expected_manifest,
+    )
+
+
+def _validate_pre_pr_readback_in_state(
+    readback_path: Path,
+    state: _MigrationState,
+    *,
+    expected_manifest: Mapping[str, Any] | None = None,
+) -> None:
+    with _cutover_lock(state):
+        _recover_incomplete_transaction_locked(state)
         _validate_pre_pr_readback_locked(
-            readback_path, expected_manifest=expected_manifest
+            readback_path,
+            state,
+            expected_manifest=expected_manifest,
         )
 
 
 def _validate_pre_pr_readback_locked(
     readback_path: Path,
+    state: _MigrationState,
     *,
     expected_manifest: Mapping[str, Any] | None = None,
 ) -> None:
@@ -638,7 +696,12 @@ def _validate_pre_pr_readback_locked(
     if readback.get("request_sha256") != _sha256(request_raw):
         raise InputError("pre-PR readback request digest mismatch")
     request = _decode_json(request_raw, request_path)
-    _validate_runtime_request(request, cast(str, operation), check_sources=False)
+    _validate_runtime_request(
+        request,
+        cast(str, operation),
+        state=state,
+        check_sources=False,
+    )
 
     source_manifest = readback.get("source_manifest")
     if not isinstance(source_manifest, dict):
@@ -667,6 +730,7 @@ def _validate_pre_pr_readback_locked(
         None,
         artifact_records,
         artifact_documents,
+        state,
     )
 
     current_manifest = (
@@ -730,14 +794,18 @@ def _validate_pre_pr_readback_locked(
         raise ApplyError("pre-PR readback active index changed")
     if readback.get("synthesized_row") is not False:
         raise InputError("pre-PR readback must prove no synthesized row")
-    journal_retained = _journal_path().exists()
+    journal_retained = state.journal_path.exists()
     if readback.get("journal_retained") is not journal_retained or journal_retained:
         raise ApplyError("pre-PR readback found a retained journal")
     if readback.get("verdict") != "PASS":
         raise InputError("pre-PR readback verdict must equal PASS")
 
 
-def _apply_runtime_request_locked(request_path: Path, operation: str) -> Path | None:
+def _apply_runtime_request_locked(
+    request_path: Path,
+    operation: str,
+    state: _MigrationState,
+) -> Path | None:
     request_raw = _safe_read_bytes(request_path)
     request = _decode_json(request_raw, request_path)
     source_manifest = None
@@ -768,16 +836,20 @@ def _apply_runtime_request_locked(request_path: Path, operation: str) -> Path | 
                     "committed phase3-rebind request cannot reconstruct its source manifest"
                 )
             return _publish_phase3_rebind_readback(
-                request_path, request, source_manifest
+                request_path, request, source_manifest, state
             )
     writes, guards, planning_roots = _validate_runtime_request(
-        request, operation, check_sources=True
+        request,
+        operation,
+        state=state,
+        check_sources=True,
     )
     _reject_cross_aliases(
         [request_path],
         [Path(item["path"]) for item in [*writes, *guards]],
     )
     _execute_transaction(
+        state=state,
         plan_path=request_path,
         plan_raw=request_raw,
         operation=operation,
@@ -790,13 +862,16 @@ def _apply_runtime_request_locked(request_path: Path, operation: str) -> Path | 
     if operation != "phase3-rebind":
         return None
     assert source_manifest is not None
-    return _publish_phase3_rebind_readback(request_path, request, source_manifest)
+    return _publish_phase3_rebind_readback(
+        request_path, request, source_manifest, state
+    )
 
 
 def _publish_phase3_rebind_readback(
     request_path: Path,
     request: Mapping[str, Any],
     source_manifest: Mapping[str, Any],
+    state: _MigrationState,
 ) -> Path:
     manifest_path = Path(cast(str, request["manifest_path"]))
     index_path = Path(cast(str, request["index_path"]))
@@ -808,7 +883,7 @@ def _publish_phase3_rebind_readback(
         readback_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
         _validate_runtime_directory(readback_dir, "Phase 3 readback directory")
         if readback_path.exists() or readback_path.is_symlink():
-            _validate_pre_pr_readback_locked(readback_path)
+            _validate_pre_pr_readback_locked(readback_path, state)
             return readback_path
         index_document = _decode_json(_safe_read_bytes(index_path), index_path)
         current_manifest = _decode_json(_safe_read_bytes(manifest_path), manifest_path)
@@ -836,7 +911,7 @@ def _publish_phase3_rebind_readback(
             "verdict": "PASS",
         }
         _atomic_write_bytes(readback_path, _json_bytes(readback), "readback")
-        _validate_pre_pr_readback_locked(readback_path)
+        _validate_pre_pr_readback_locked(readback_path, state)
     except (MigrationError, OSError) as exc:
         raise CommittedAwaitingReadbackError(
             "committed-awaiting-readback: Phase 3 replacement is committed but "
@@ -880,6 +955,7 @@ def _reconstruct_phase3_rebind_source_manifest(
 
 def _execute_transaction(
     *,
+    state: _MigrationState,
     plan_path: Path,
     plan_raw: bytes,
     operation: str,
@@ -965,7 +1041,7 @@ def _execute_transaction(
             journal["read_only_guards"] = guard_records
         _inject_fault("journal", 0)
         _inject_fault("journal-create", 0)
-        _write_journal(journal)
+        _write_journal(journal, state)
         _verify_read_only_guards(read_only_guards, held_parents)
 
         for index, (write, target) in enumerate(zip(writes, targets)):
@@ -986,7 +1062,7 @@ def _execute_transaction(
                 target["backup_device"], target["backup_inode"] = _identity_at(
                     parent, target["backup_name"]
                 )
-                _write_journal(journal)
+                _write_journal(journal, state)
             replacement_bytes = _json_bytes(write["replacement"])
             _write_new_file_at(
                 parent,
@@ -999,7 +1075,7 @@ def _execute_transaction(
             target["replacement_device"], target["replacement_inode"] = _identity_at(
                 parent, target["replacement_name"]
             )
-            _write_journal(journal)
+            _write_journal(journal, state)
         _verify_read_only_guards(read_only_guards, held_parents)
         for write in writes:
             path = Path(write["path"])
@@ -1012,10 +1088,10 @@ def _execute_transaction(
             _verify_source_identity_at(held_parents[path.parent], path.name, write, path)
         _verify_read_only_guards(read_only_guards, held_parents)
         journal["phase"] = "prepared"
-        _write_journal(journal)
+        _write_journal(journal, state)
         _inject_fault("journal-transition", 0)
         journal["phase"] = "committing"
-        _write_journal(journal)
+        _write_journal(journal, state)
 
         for write in writes:
             path = Path(write["path"])
@@ -1043,18 +1119,18 @@ def _execute_transaction(
             journal["completed_replacements"].append(index)
             _inject_fault("journal", index + 1)
             _inject_fault("journal-transition", index + 1)
-            _write_journal(journal)
+            _write_journal(journal, state)
         journal["phase"] = "committed"
         _inject_fault("journal-transition", len(targets) + 1)
-        _write_journal(journal)
-        _cleanup_transaction(journal, held_parents=held_parents)
+        _write_journal(journal, state)
+        _cleanup_transaction(journal, state=state, held_parents=held_parents)
         return "committed"
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
-        if _journal_path().exists():
+        if state.journal_path.exists():
             try:
-                recovery_disposition = _recover_incomplete_transaction_locked()
+                recovery_disposition = _recover_incomplete_transaction_locked(state)
             except ApplyError as recovery_exc:
                 raise ApplyError(
                     f"transaction failed; recovery remains pending: {exc}; {recovery_exc}"
@@ -1070,19 +1146,23 @@ def _execute_transaction(
 
 
 def recover_incomplete_transaction() -> str:
-    with _cutover_lock():
-        return _recover_incomplete_transaction_locked()
+    return _recover_incomplete_transaction_in_state(_production_state())
 
 
-def _recover_incomplete_transaction_locked() -> str:
-    journal_path = _journal_path()
+def _recover_incomplete_transaction_in_state(state: _MigrationState) -> str:
+    with _cutover_lock(state):
+        return _recover_incomplete_transaction_locked(state)
+
+
+def _recover_incomplete_transaction_locked(state: _MigrationState) -> str:
+    journal_path = state.journal_path
     if not journal_path.exists():
         return "no-transaction"
     try:
         journal = _decode_json(_safe_read_bytes(journal_path), journal_path)
     except MigrationError as exc:
         raise ApplyError(f"cannot read recovery journal: {exc}") from exc
-    journal = _validate_recovery_journal(journal)
+    journal = _validate_recovery_journal(journal, state)
     held_parents: dict[Path, dict[str, Any]] = {}
     try:
         failures: list[str] = []
@@ -1160,7 +1240,7 @@ def _recover_incomplete_transaction_locked() -> str:
                 failures.append(f"{parent_path}: {exc}")
         if failures:
             raise ApplyError("recovery failures: " + "; ".join(failures))
-        _remove_transaction_journal()
+        _remove_transaction_journal(state)
         return (
             "committed-replacement-retained"
             if journal["phase"] == "committed"
@@ -1308,14 +1388,16 @@ def _cleanup_target_artifacts(
     return failures
 
 
-def _remove_transaction_journal() -> None:
-    journal_path = _journal_path()
+def _remove_transaction_journal(state: _MigrationState) -> None:
+    journal_path = state.journal_path
     _inject_fault("journal-cleanup", 0)
     journal_path.unlink(missing_ok=True)
     _fsync_directory(journal_path.parent)
 
 
-def _validate_recovery_journal(document: Mapping[str, Any]) -> dict[str, Any]:
+def _validate_recovery_journal(
+    document: Mapping[str, Any], state: _MigrationState
+) -> dict[str, Any]:
     try:
         journal_keys = {
             "schema",
@@ -1405,7 +1487,11 @@ def _validate_recovery_journal(document: Mapping[str, Any]) -> dict[str, Any]:
             _validate_writes(writes, planning_roots, check_paths=False)
         else:
             writes, guards, planning_roots = _validate_runtime_request(
-                plan, cast(str, operation), check_sources=False, check_paths=False
+                plan,
+                cast(str, operation),
+                state=state,
+                check_sources=False,
+                check_paths=False,
             )
             if document.get("plan_payload_sha256") != plan["payload_sha256"]:
                 raise InputError("recovery journal request payload digest mismatch")
@@ -2420,6 +2506,7 @@ def _validate_runtime_request(
     request: Mapping[str, Any],
     expected_operation: str | None,
     *,
+    state: _MigrationState,
     check_sources: bool,
     check_paths: bool = True,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[Path]]:
@@ -2509,6 +2596,7 @@ def _validate_runtime_request(
             cast(Mapping[str, Any] | None, row_identity),
             artifact_records,
             artifact_documents,
+            state,
         )
 
     writes = [_runtime_write(manifest_path, source_records["manifest"], replacement_manifest)]
@@ -2672,6 +2760,7 @@ def _validate_runtime_projection(
     row_identity: Mapping[str, Any] | None,
     artifact_records: Sequence[Mapping[str, Any]],
     artifact_documents: Mapping[str, Mapping[str, Any]],
+    state: _MigrationState,
 ) -> None:
     project_planning_root = _validate_runtime_manifest(
         replacement_manifest, manifest_path, index_path, planning_root
@@ -2709,6 +2798,7 @@ def _validate_runtime_projection(
             replacement_index,
             artifact_records,
             artifact_documents,
+            state,
         )
         expected_index = copy.deepcopy(dict(source_index))
     else:
@@ -2767,6 +2857,7 @@ def _validate_pre_pr_bind_projection(
     replacement_index: Mapping[str, Any],
     artifact_records: Sequence[Mapping[str, Any]],
     artifact_documents: Mapping[str, Mapping[str, Any]],
+    state: _MigrationState,
 ) -> None:
     _validate_open_pre_pr_manifest(
         source_manifest,
@@ -2813,6 +2904,7 @@ def _validate_pre_pr_bind_projection(
             artifact_documents,
             manifest_path,
             scratch_dir,
+            state,
         )
         return
     _validate_phase3_bind(
@@ -2822,6 +2914,7 @@ def _validate_pre_pr_bind_projection(
         artifact_documents,
         manifest_path,
         scratch_dir,
+        state,
     )
 
 
@@ -3150,6 +3243,7 @@ def _validate_phase3_bind(
     documents: Mapping[str, Mapping[str, Any]],
     manifest_path: Path,
     scratch_dir: Path,
+    state: _MigrationState,
 ) -> None:
     if any(
         source_manifest.get(key) is not None
@@ -3191,7 +3285,12 @@ def _validate_phase3_bind(
     ):
         raise InputError("phase3-bind artifact roles are partial, mixed, or unknown")
     _validate_phase3_artifact_bindings(
-        source_manifest, estimate, records, scratch_dir, manifest_path.parent
+        source_manifest,
+        estimate,
+        records,
+        scratch_dir,
+        manifest_path.parent,
+        state,
     )
     _validate_phase3_disposition(estimate, records, disposition)
     if source_manifest.get("cold_start_disposition_ref") != cold_start_ref:
@@ -3230,6 +3329,7 @@ def _validate_phase3_rebind(
     documents: Mapping[str, Mapping[str, Any]],
     manifest_path: Path,
     scratch_dir: Path,
+    state: _MigrationState,
 ) -> None:
     _validate_phase3_rebind_manifest_keys(source_manifest, replacement_manifest)
     current_attempt, source_lineage = _validate_phase3_revision_state(
@@ -3278,6 +3378,7 @@ def _validate_phase3_rebind(
         manifest_path,
         scratch_dir,
         current_attempt + 1,
+        state,
     )
     _validate_phase3_rebind_history_transition(
         source_manifest, replacement_manifest, manifest_path, records
@@ -3730,6 +3831,7 @@ def _validate_phase3_revised_estimate(
     manifest_path: Path,
     scratch_dir: Path,
     next_attempt: int,
+    state: _MigrationState,
 ) -> None:
     estimate_record = records["phase-3-estimate-writeback"]
     proposal_record = records["phase-3-proposal"]
@@ -3819,7 +3921,12 @@ def _validate_phase3_revised_estimate(
     ):
         raise InputError("phase3-rebind revised estimate currentness is incomplete")
     _validate_phase3_artifact_bindings(
-        manifest, revised_estimate, records, scratch_dir, manifest_path.parent
+        manifest,
+        revised_estimate,
+        records,
+        scratch_dir,
+        manifest_path.parent,
+        state,
     )
     _validate_phase3_disposition(
         revised_estimate, records, revised_estimate.get("disposition")
@@ -4026,6 +4133,7 @@ def _validate_phase3_artifact_bindings(
     records: Mapping[str, Mapping[str, Any]],
     scratch_dir: Path,
     planning_dir: Path,
+    state: _MigrationState,
 ) -> None:
     bindings = (
         (
@@ -4096,7 +4204,7 @@ def _validate_phase3_artifact_bindings(
     ):
         raise InputError("phase3-bind estimate does not match manifest contract identity")
     _validate_phase3_producer_git_identities(
-        manifest, estimate, records, scratch_dir
+        manifest, estimate, records, scratch_dir, state
     )
     cold_ref = estimate.get("cold_start_disposition_ref")
     if cold_ref is not None:
@@ -4114,6 +4222,7 @@ def _validate_phase3_producer_git_identities(
     estimate: Mapping[str, Any],
     records: Mapping[str, Mapping[str, Any]],
     scratch_dir: Path,
+    state: _MigrationState,
 ) -> None:
     repo_value = manifest.get("repo_root")
     if not isinstance(repo_value, str):
@@ -4207,7 +4316,11 @@ def _validate_phase3_producer_git_identities(
     readback = _decode_json(_safe_read_bytes(readback_path), readback_path)
     if readback.get("operation") != "phase0-reresolve":
         raise InputError("phase3-bind producer readback operation mismatch")
-    _validate_pre_pr_readback_locked(readback_path, expected_manifest=manifest)
+    _validate_pre_pr_readback_locked(
+        readback_path,
+        state,
+        expected_manifest=manifest,
+    )
 
 
 def _verify_historical_git_blob(
@@ -5134,23 +5247,25 @@ def _atomic_write_bytes(path: Path, payload: bytes, fault_prefix: str | None = N
 
 
 def _state_root() -> Path:
-    if _TEST_STATE_ROOT is not None:
-        return _TEST_STATE_ROOT
     return (
         Path(pwd.getpwuid(os.getuid()).pw_dir)
         / ".local/state/ai/wu-session-migration"
     )
 
 
+def _production_state() -> _MigrationState:
+    return _MigrationState(_state_root())
+
+
 def _journal_path() -> Path:
-    return _state_root() / "transaction.json"
+    return _production_state().journal_path
 
 
 @contextmanager
-def _cutover_lock() -> Iterator[None]:
-    root = _state_root()
+def _cutover_lock(state: _MigrationState) -> Iterator[None]:
+    root = state.root
     root.mkdir(parents=True, exist_ok=True)
-    descriptor = os.open(root / "cutover.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    descriptor = os.open(state.lock_path, os.O_RDWR | os.O_CREAT, 0o600)
     try:
         fcntl.flock(descriptor, fcntl.LOCK_EX)
         yield
@@ -5159,15 +5274,18 @@ def _cutover_lock() -> Iterator[None]:
         os.close(descriptor)
 
 
-def _write_journal(journal: Mapping[str, Any]) -> None:
-    root = _state_root()
+def _write_journal(
+    journal: Mapping[str, Any], state: _MigrationState
+) -> None:
+    root = state.root
     root.mkdir(parents=True, exist_ok=True)
-    _atomic_write_bytes(_journal_path(), _json_bytes(journal), "journal")
+    _atomic_write_bytes(state.journal_path, _json_bytes(journal), "journal")
 
 
 def _cleanup_transaction(
     journal: Mapping[str, Any],
     *,
+    state: _MigrationState,
     held_parents: Mapping[Path, Mapping[str, Any]],
 ) -> None:
     failures: list[str] = []
@@ -5185,7 +5303,7 @@ def _cleanup_transaction(
             failures.append(f"{parent_path}: {exc}")
     if failures:
         raise ApplyError("transaction cleanup failures: " + "; ".join(failures))
-    _remove_transaction_journal()
+    _remove_transaction_journal(state)
 
 
 def _capture_record(command: list[str], payload: Any) -> dict[str, Any]:

@@ -20,8 +20,68 @@ SPEC = importlib.util.spec_from_file_location(
     "wu_session_migration", TOOL_DIR / "wu_session_migration.py"
 )
 assert SPEC is not None and SPEC.loader is not None
-MIGRATION = importlib.util.module_from_spec(SPEC)
-SPEC.loader.exec_module(MIGRATION)
+PRODUCTION_MIGRATION = importlib.util.module_from_spec(SPEC)
+SPEC.loader.exec_module(PRODUCTION_MIGRATION)
+
+
+class _MigrationTestHarness:
+    def __init__(self, module: Any):
+        object.__setattr__(self, "_module", module)
+        object.__setattr__(self, "_root", None)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._module, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        if name in {"_module", "_root"}:
+            object.__setattr__(self, name, value)
+            return
+        setattr(self._module, name, value)
+
+    def bind_state(self, root: Path | None) -> None:
+        object.__setattr__(self, "_root", root)
+
+    def _state(self) -> Any:
+        if self._root is None:
+            raise AssertionError("isolated migration state is not bound")
+        return self._module._MigrationState(self._root)
+
+    def main(self, argv: list[str] | None = None) -> int:
+        return self._module._main(argv, self._state())
+
+    def apply_plan(self, plan_path: Path) -> None:
+        self._module._apply_plan_in_state(plan_path, self._state())
+
+    def apply_runtime_request(
+        self, request_path: Path, operation: str
+    ) -> Path | None:
+        return self._module._apply_runtime_request_in_state(
+            request_path, operation, self._state()
+        )
+
+    def validate_pre_pr_readback(
+        self,
+        readback_path: Path,
+        *,
+        expected_manifest: dict[str, Any] | None = None,
+    ) -> None:
+        self._module._validate_pre_pr_readback_in_state(
+            readback_path,
+            self._state(),
+            expected_manifest=expected_manifest,
+        )
+
+    def recover_incomplete_transaction(self) -> str:
+        return self._module._recover_incomplete_transaction_in_state(self._state())
+
+    def _state_root(self) -> Path:
+        return self._state().root
+
+    def _journal_path(self) -> Path:
+        return self._state().journal_path
+
+
+MIGRATION = _MigrationTestHarness(PRODUCTION_MIGRATION)
 ApplyError = MIGRATION.ApplyError
 InputError = MIGRATION.InputError
 apply_plan = MIGRATION.apply_plan
@@ -56,7 +116,7 @@ GIT_ENV = {
 def isolated_transaction_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     global TOOL_DIR
     state_root = tmp_path / "transaction-state"
-    setattr(MIGRATION, "_TEST_STATE_ROOT", state_root)
+    MIGRATION.bind_state(state_root)
     wrapper = tmp_path / "wu-session-migration-test-entry.py"
     wrapper.write_text(
         "import importlib.util, pathlib, sys\n"
@@ -64,15 +124,15 @@ def isolated_transaction_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         "spec = importlib.util.spec_from_file_location('wu_session_migration_test_cli', source)\n"
         "module = importlib.util.module_from_spec(spec)\n"
         "spec.loader.exec_module(module)\n"
-        f"module._TEST_STATE_ROOT = pathlib.Path({str(state_root)!r})\n"
-        "raise SystemExit(module.main())\n"
+        f"state = module._MigrationState(pathlib.Path({str(state_root)!r}))\n"
+        "raise SystemExit(module._main(sys.argv[1:], state))\n"
     )
     TOOL_DIR = wrapper
     monkeypatch.delenv("WU_SESSION_MIGRATION_STATE_DIR", raising=False)
     setattr(MIGRATION, "FAULT_HOOK", None)
     yield
     setattr(MIGRATION, "FAULT_HOOK", None)
-    setattr(MIGRATION, "_TEST_STATE_ROOT", None)
+    MIGRATION.bind_state(None)
     TOOL_DIR = REAL_TOOL_DIR
 
 
@@ -4239,26 +4299,117 @@ def test_phase3_rebind_one_shot_committed_cleanup_recovery_closes_readback(
     MIGRATION.validate_pre_pr_readback(readback_path)
 
 
-def test_public_transaction_entry_points_have_no_lock_or_recovery_bypass(
+def test_supported_production_entry_points_bind_one_canonical_state(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
-    assert set(inspect.signature(MIGRATION.apply_plan).parameters) == {"plan_path"}
-    assert set(inspect.signature(MIGRATION.apply_runtime_request).parameters) == {
+    public = PRODUCTION_MIGRATION
+    assert set(inspect.signature(public.main).parameters) == {"argv"}
+    assert set(inspect.signature(public.apply_plan).parameters) == {"plan_path"}
+    assert set(inspect.signature(public.apply_runtime_request).parameters) == {
         "request_path",
         "operation",
     }
-    assert not inspect.signature(MIGRATION.recover_incomplete_transaction).parameters
+    assert set(inspect.signature(public.validate_pre_pr_readback).parameters) == {
+        "readback_path",
+        "expected_manifest",
+    }
+    assert not inspect.signature(public.recover_incomplete_transaction).parameters
 
     alternate = tmp_path / "caller-selected-state"
     monkeypatch.setenv("WU_SESSION_MIGRATION_STATE_DIR", str(alternate))
-    setattr(MIGRATION, "_TEST_STATE_ROOT", None)
     production_root = (
-        Path(MIGRATION.pwd.getpwuid(os.getuid()).pw_dir)
+        Path(public.pwd.getpwuid(os.getuid()).pw_dir)
         / ".local/state/ai/wu-session-migration"
     )
-    assert MIGRATION._state_root() == production_root
-    assert MIGRATION._state_root() != alternate
-    assert "WU_SESSION_MIGRATION_STATE_DIR" not in inspect.getsource(MIGRATION._state_root)
+    assert not hasattr(public, "_TEST_STATE_ROOT")
+    setattr(public, "_TEST_STATE_ROOT", alternate)
+    try:
+        states = [public._production_state() for _ in range(5)]
+        assert {state.root for state in states} == {production_root}
+        assert {state.lock_path for state in states} == {
+            production_root / "cutover.lock"
+        }
+        assert {state.journal_path for state in states} == {
+            production_root / "transaction.json"
+        }
+        assert all(state.root != alternate for state in states)
+        with pytest.raises(AttributeError, match="immutable"):
+            states[0].root = alternate
+    finally:
+        delattr(public, "_TEST_STATE_ROOT")
+
+    entry_points = (
+        public.main,
+        public.apply_plan,
+        public.apply_runtime_request,
+        public.validate_pre_pr_readback,
+        public.recover_incomplete_transaction,
+    )
+    assert all("_production_state()" in inspect.getsource(entry) for entry in entry_points)
+    state_source = inspect.getsource(public._state_root)
+    assert "_TEST_STATE_ROOT" not in state_source
+    assert "WU_SESSION_MIGRATION_STATE_DIR" not in state_source
+
+    help_result = subprocess.run(
+        [sys.executable, str(REAL_TOOL_DIR), "--help"],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert help_result.returncode == 0
+    assert "state-root" not in help_result.stdout
+    assert "state-dir" not in help_result.stdout
+
+    fresh_probe = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            (
+                "import importlib.util, pathlib\n"
+                f"source = pathlib.Path({str(REAL_TOOL_DIR / 'wu_session_migration.py')!r})\n"
+                "spec = importlib.util.spec_from_file_location('fresh_migration', source)\n"
+                "module = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(module)\n"
+                "state = module._production_state()\n"
+                "print(state.root)\n"
+                "print(state.lock_path)\n"
+                "print(state.journal_path)\n"
+            ),
+        ],
+        env={**os.environ, "WU_SESSION_MIGRATION_STATE_DIR": str(alternate)},
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert fresh_probe.returncode == 0, fresh_probe.stderr
+    assert fresh_probe.stdout.splitlines() == [
+        str(production_root),
+        str(production_root / "cutover.lock"),
+        str(production_root / "transaction.json"),
+    ]
+
+
+def test_internal_state_path_uses_transaction_mechanics_without_public_reachability(
+    tmp_path: Path,
+):
+    internal_root = MIGRATION._state_root()
+    redirected_root = tmp_path / "unsupported-redirect"
+    malformed_plan = tmp_path / "malformed-plan.json"
+    malformed_plan.write_text("{", encoding="utf-8")
+    os.environ["WU_SESSION_MIGRATION_STATE_DIR"] = str(redirected_root)
+    try:
+        assert MIGRATION.main(["apply", "--plan", str(malformed_plan)]) == 2
+    finally:
+        os.environ.pop("WU_SESSION_MIGRATION_STATE_DIR", None)
+
+    assert internal_root != PRODUCTION_MIGRATION._state_root()
+    assert (internal_root / "cutover.lock").is_file()
+    assert not redirected_root.exists()
+    assert not MIGRATION._journal_path().exists()
+    help_text = PRODUCTION_MIGRATION._parser().format_help()
+    assert str(internal_root) not in help_text
+    assert "state-root" not in help_text
+    assert "state-dir" not in help_text
 
 
 def test_recovery_subprocess_interruption_is_retried_without_target_mutation(tmp_path: Path):
