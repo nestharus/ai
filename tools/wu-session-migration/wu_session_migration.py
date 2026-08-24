@@ -33,6 +33,7 @@ PRE_PR_READBACK_SCHEMA = "wu-session-pre-pr-write-readback-v1"
 RUNTIME_OPERATIONS = {
     "cold-start-disposition-bind",
     "phase3-bind",
+    "phase3-rebind",
     "phase0-init",
     "phase0-reresolve",
     "phase7-upsert",
@@ -44,7 +45,9 @@ PRE_PR_BIND_OPERATIONS = {
     "cold-start-disposition-bind",
     "phase0-reresolve",
     "phase3-bind",
+    "phase3-rebind",
 }
+PHASE3_MAX_BINDING_ATTEMPT = 3
 SUPPORTED_TICKET_SYSTEMS = {"jira", "linear"}
 TRUSTED_COMMAND_TIMEOUT_SECONDS = 60
 EXPECTED_COUNTS = {
@@ -159,6 +162,13 @@ RUNTIME_ALLOWED_MANIFEST_CHANGES = {
         "phase_3_estimate_writeback_sha256",
         "phase_history",
     },
+    "phase3-rebind": {
+        "phase_3_estimate_writeback_ref",
+        "phase_3_estimate_writeback_sha256",
+        "phase_3_binding_attempt",
+        "phase_3_revision_history",
+        "phase_history",
+    },
     "phase7-upsert": {
         "draft_pr_url",
         "draft_pr_number",
@@ -204,6 +214,21 @@ PHASE0_RERESOLVE_REQUIRED_CHANGES = {
     "contract_resolution_producing_invocation_uuid",
     "contract_resolution_sha256",
     "ticket_snapshot_producing_invocation_uuid",
+}
+PHASE3_REVISION_FIELDS = {
+    "phase_3_binding_attempt",
+    "phase_3_revision_history",
+}
+PHASE3_REVISION_ENTRY_KEYS = {
+    "attempt",
+    "estimate_writeback_ref",
+    "estimate_writeback_sha256",
+    "phase_3_proposal_path",
+    "phase_3_proposal_sha256",
+    "return_to_phase_3_ref",
+    "return_to_phase_3_sha256",
+    "return_to_phase_3_audit_ref",
+    "return_to_phase_3_audit_sha256",
 }
 
 # Tests replace this hook to inject deterministic failures without weakening production checks.
@@ -609,6 +634,12 @@ def validate_pre_pr_readback(
         if len(current_history) != len(source_history) + 1:
             raise InputError("pre-PR readback Phase 3 history is not one exact append")
         _validate_canonical_phase3_history_entry(current_history[-1])
+    elif operation == "phase3-rebind":
+        _validate_phase3_rebind_history_transition(
+            source_manifest,
+            current_manifest,
+            manifest_path,
+        )
     if expected_manifest is None:
         if readback.get("manifest_identity") != runtime_source_identity(manifest_path):
             raise ApplyError("pre-PR readback manifest identity mismatch")
@@ -2370,7 +2401,9 @@ def _validate_runtime_artifact_sources(
                 "cold-start-disposition",
                 "phase-0-contract-resolution",
                 "phase-3-estimate-writeback",
-            }:
+                "prior-phase-3-estimate-writeback",
+                "phase-4-return-decision",
+            } or role.startswith("lineage-estimate-writeback-attempt-"):
                 documents[role] = _decode_json(_safe_read_bytes(path), path)
     return records, documents
 
@@ -2545,16 +2578,21 @@ def _validate_pre_pr_bind_projection(
     artifact_records: Sequence[Mapping[str, Any]],
     artifact_documents: Mapping[str, Mapping[str, Any]],
 ) -> None:
-    _validate_open_pre_pr_manifest(source_manifest)
+    _validate_open_pre_pr_manifest(
+        source_manifest,
+        allow_phase3=operation == "phase3-rebind",
+    )
     _validate_pre_pr_index_absence(source_index, source_manifest, manifest_path)
     if replacement_index != source_index:
         raise InputError(f"{operation} cannot change the active index")
-    if set(replacement_manifest) != set(source_manifest):
+    if operation == "phase3-rebind":
+        _validate_phase3_rebind_manifest_keys(source_manifest, replacement_manifest)
+    elif set(replacement_manifest) != set(source_manifest):
         raise InputError(f"{operation} cannot add or remove manifest fields")
     changed = {
         key
-        for key in source_manifest
-        if source_manifest[key] != replacement_manifest[key]
+        for key in set(source_manifest) | set(replacement_manifest)
+        if source_manifest.get(key) != replacement_manifest.get(key)
     }
     _validate_pre_pr_changed_keys(operation, changed)
     records = {record["role"]: record for record in artifact_records}
@@ -2574,6 +2612,16 @@ def _validate_pre_pr_bind_projection(
             replacement_manifest,
             records,
             artifact_documents,
+            scratch_dir,
+        )
+        return
+    if operation == "phase3-rebind":
+        _validate_phase3_rebind(
+            source_manifest,
+            replacement_manifest,
+            records,
+            artifact_documents,
+            manifest_path,
             scratch_dir,
         )
         return
@@ -2724,7 +2772,9 @@ def _validate_phase0_reresolve(
             raise InputError(f"phase0-reresolve {role} must remain below scratch_dir")
 
 
-def _validate_open_pre_pr_manifest(manifest: Mapping[str, Any]) -> None:
+def _validate_open_pre_pr_manifest(
+    manifest: Mapping[str, Any], *, allow_phase3: bool = False
+) -> None:
     required_bindings = {
         "cold_start_disposition_ref",
         "phase_3_estimate_writeback_ref",
@@ -2755,11 +2805,13 @@ def _validate_open_pre_pr_manifest(manifest: Mapping[str, Any]) -> None:
     post_merge = manifest.get("post_merge")
     if post_merge is not None and post_merge != {}:
         raise InputError("pre-PR manifest has post-merge state")
-    _validate_pre_pr_history(manifest.get("phase_history"))
+    _validate_pre_pr_history(manifest.get("phase_history"), allow_phase3=allow_phase3)
     _validate_pre_pr_route_eligibility(manifest)
 
 
-def _validate_pre_pr_history(value: Any) -> list[Mapping[str, Any]]:
+def _validate_pre_pr_history(
+    value: Any, *, allow_phase3: bool = False
+) -> list[Mapping[str, Any]]:
     if not isinstance(value, list):
         raise InputError("pre-PR phase_history must be an object list")
     result: list[Mapping[str, Any]] = []
@@ -2770,7 +2822,7 @@ def _validate_pre_pr_history(value: Any) -> list[Mapping[str, Any]]:
             or not entry["phase"].strip()
         ):
             raise InputError(f"pre-PR phase_history entry {index} is malformed")
-        if _is_phase3_marker(entry["phase"]):
+        if not allow_phase3 and _is_phase3_marker(entry["phase"]):
             raise InputError("pre-PR phase_history already contains Phase 3")
         result.append(entry)
     return result
@@ -2969,6 +3021,560 @@ def _validate_phase3_bind(
     if len(replacement_history) != len(source_history) + 1:
         raise InputError("phase3-bind must append exactly one history entry")
     _validate_canonical_phase3_history_entry(replacement_history[-1])
+
+
+def _validate_phase3_rebind_manifest_keys(
+    source_manifest: Mapping[str, Any], replacement_manifest: Mapping[str, Any]
+) -> None:
+    present = PHASE3_REVISION_FIELDS & set(source_manifest)
+    if present not in (set(), PHASE3_REVISION_FIELDS):
+        raise InputError("phase3-rebind source revision fields are partial")
+    if set(replacement_manifest) != set(source_manifest) | PHASE3_REVISION_FIELDS:
+        raise InputError("phase3-rebind manifest fields are not the exact revision projection")
+
+
+def _validate_phase3_rebind(
+    source_manifest: Mapping[str, Any],
+    replacement_manifest: Mapping[str, Any],
+    records: Mapping[str, Mapping[str, Any]],
+    documents: Mapping[str, Mapping[str, Any]],
+    manifest_path: Path,
+    scratch_dir: Path,
+) -> None:
+    _validate_phase3_rebind_manifest_keys(source_manifest, replacement_manifest)
+    current_attempt, source_lineage = _validate_phase3_revision_state(
+        source_manifest, manifest_path
+    )
+    if current_attempt >= PHASE3_MAX_BINDING_ATTEMPT:
+        raise InputError("phase3-rebind exceeds the three-attempt cap")
+    prior_estimate = documents.get("prior-phase-3-estimate-writeback")
+    revised_estimate = documents.get("phase-3-estimate-writeback")
+    return_decision = documents.get("phase-4-return-decision")
+    if not all(
+        isinstance(document, Mapping)
+        for document in (prior_estimate, revised_estimate, return_decision)
+    ):
+        raise InputError("phase3-rebind lacks a required JSON artifact")
+    _validate_phase3_rebind_roles(
+        records,
+        cast(Mapping[str, Any], prior_estimate),
+        cast(Mapping[str, Any], revised_estimate),
+        source_lineage,
+    )
+    _validate_phase3_prior_binding(
+        source_manifest,
+        cast(Mapping[str, Any], prior_estimate),
+        records,
+        manifest_path,
+        current_attempt,
+    )
+    _validate_phase3_lineage_guards(records, documents, source_lineage)
+    _validate_phase4_return_decision(
+        source_manifest,
+        cast(Mapping[str, Any], prior_estimate),
+        cast(Mapping[str, Any], return_decision),
+        records,
+        source_lineage,
+        manifest_path,
+    )
+    _validate_phase3_revised_estimate(
+        source_manifest,
+        cast(Mapping[str, Any], prior_estimate),
+        cast(Mapping[str, Any], revised_estimate),
+        records,
+        source_lineage,
+        manifest_path,
+        scratch_dir,
+        current_attempt + 1,
+    )
+    _validate_phase3_rebind_history_transition(
+        source_manifest, replacement_manifest, manifest_path
+    )
+    estimate_record = records["phase-3-estimate-writeback"]
+    if (
+        replacement_manifest.get("phase_3_estimate_writeback_ref")
+        != estimate_record.get("path")
+        or replacement_manifest.get("phase_3_estimate_writeback_sha256")
+        != estimate_record.get("sha256")
+    ):
+        raise InputError("phase3-rebind replacement does not bind the revised estimate")
+
+
+def _validate_phase3_rebind_roles(
+    records: Mapping[str, Mapping[str, Any]],
+    prior_estimate: Mapping[str, Any],
+    revised_estimate: Mapping[str, Any],
+    lineage: Sequence[Mapping[str, Any]],
+) -> None:
+    required = {
+        "phase-0-ticket-snapshot",
+        "phase-3-estimate-writeback",
+        "phase-3-proposal",
+        "phase-4-return-audit",
+        "phase-4-return-decision",
+        "prior-phase-3-estimate-writeback",
+        "prior-phase-3-proposal",
+        "resolved-ticket-contract",
+        "resolved-ticket-operator",
+    }
+    if revised_estimate.get("cold_start_disposition_ref") is not None:
+        required.add("cold-start-disposition")
+    if revised_estimate.get("disposition") == "write_verified":
+        required.add("write-verification-evidence")
+    if prior_estimate.get("disposition") == "write_verified":
+        required.add("prior-write-verification-evidence")
+    for entry in lineage:
+        attempt = entry["attempt"]
+        required.update(
+            {
+                f"lineage-estimate-writeback-attempt-{attempt}",
+                f"lineage-phase-3-proposal-attempt-{attempt}",
+                f"lineage-return-audit-attempt-{attempt}",
+                f"lineage-return-decision-attempt-{attempt}",
+            }
+        )
+    actual = set(records)
+    if actual not in (required, required | {"phase-0-reresolve-readback"}):
+        raise InputError(
+            "phase3-rebind artifact roles are partial, mixed, or unknown: "
+            f"missing={sorted(required - actual)} unknown={sorted(actual - required)}"
+        )
+
+
+def _validate_phase3_prior_binding(
+    manifest: Mapping[str, Any],
+    estimate: Mapping[str, Any],
+    records: Mapping[str, Mapping[str, Any]],
+    manifest_path: Path,
+    current_attempt: int,
+) -> None:
+    estimate_record = records["prior-phase-3-estimate-writeback"]
+    if (
+        manifest.get("phase_3_estimate_writeback_ref") != estimate_record.get("path")
+        or manifest.get("phase_3_estimate_writeback_sha256")
+        != estimate_record.get("sha256")
+    ):
+        raise InputError("phase3-rebind prior estimate binding is stale")
+    if current_attempt > 1 and estimate_record.get("path") != str(
+        _phase3_estimate_path(
+            manifest_path, cast(str, manifest["ticket_id"]), current_attempt
+        )
+    ):
+        raise InputError("phase3-rebind prior estimate path is not attempt-versioned")
+    if (
+        estimate.get("schema_version") != "phase-3-estimate-writeback-v1"
+        or estimate.get("ticket_id") != manifest.get("ticket_id")
+        or estimate.get("ticket_system") != manifest.get("ticket_system")
+        or (current_attempt > 1 and estimate.get("phase_3_binding_attempt") != current_attempt)
+        or (current_attempt == 1 and estimate.get("phase_3_binding_attempt", 1) != 1)
+    ):
+        raise InputError("phase3-rebind prior estimate identity is malformed")
+    proposal_record = records["prior-phase-3-proposal"]
+    if (
+        estimate.get("phase_3_proposal_path") != proposal_record.get("path")
+        or estimate.get("phase_3_proposal_sha256") != proposal_record.get("sha256")
+        or not _is_below(Path(cast(str, proposal_record.get("path"))), manifest_path.parent)
+    ):
+        raise InputError("phase3-rebind prior proposal identity is stale")
+    _validate_phase3_disposition(
+        estimate,
+        records,
+        estimate.get("disposition"),
+        evidence_role="prior-write-verification-evidence",
+    )
+
+
+def _validate_phase3_lineage_guards(
+    records: Mapping[str, Mapping[str, Any]],
+    documents: Mapping[str, Mapping[str, Any]],
+    lineage: Sequence[Mapping[str, Any]],
+) -> None:
+    for entry in lineage:
+        attempt = entry["attempt"]
+        identities = (
+            (
+                f"lineage-estimate-writeback-attempt-{attempt}",
+                entry["estimate_writeback_ref"],
+                entry["estimate_writeback_sha256"],
+            ),
+            (
+                f"lineage-phase-3-proposal-attempt-{attempt}",
+                entry["phase_3_proposal_path"],
+                entry["phase_3_proposal_sha256"],
+            ),
+            (
+                f"lineage-return-decision-attempt-{attempt}",
+                entry["return_to_phase_3_ref"],
+                entry["return_to_phase_3_sha256"],
+            ),
+            (
+                f"lineage-return-audit-attempt-{attempt}",
+                entry["return_to_phase_3_audit_ref"],
+                entry["return_to_phase_3_audit_sha256"],
+            ),
+        )
+        for role, path, digest in identities:
+            record = records[role]
+            if record.get("path") != path or record.get("sha256") != digest:
+                raise InputError(f"phase3-rebind {role} does not match retained lineage")
+        estimate = documents.get(f"lineage-estimate-writeback-attempt-{attempt}")
+        if (
+            not isinstance(estimate, Mapping)
+            or estimate.get("phase_3_proposal_path") != entry["phase_3_proposal_path"]
+            or estimate.get("phase_3_proposal_sha256")
+            != entry["phase_3_proposal_sha256"]
+        ):
+            raise InputError("phase3-rebind retained estimate/proposal lineage is malformed")
+
+
+def _validate_phase4_return_decision(
+    manifest: Mapping[str, Any],
+    prior_estimate: Mapping[str, Any],
+    decision: Mapping[str, Any],
+    records: Mapping[str, Mapping[str, Any]],
+    lineage: Sequence[Mapping[str, Any]],
+    manifest_path: Path,
+) -> None:
+    decision_record = records["phase-4-return-decision"]
+    audit_record = records["phase-4-return-audit"]
+    artifact_hashes = decision.get("artifact_sha256")
+    estimate_identity = decision.get("estimate_disposition")
+    proposal_identity = decision.get("phase_3_proposal")
+    proposal_path = cast(str, prior_estimate.get("phase_3_proposal_path"))
+    proposal_sha256 = prior_estimate.get("phase_3_proposal_sha256")
+    direct_proposal_match = isinstance(proposal_identity, Mapping) and (
+        proposal_identity.get("path"), proposal_identity.get("sha256")
+    ) == (proposal_path, proposal_sha256)
+    mapped_proposal_match = isinstance(artifact_hashes, Mapping) and (
+        artifact_hashes.get(proposal_path) == proposal_sha256
+    )
+    if (
+        decision.get("ticket_id") != manifest.get("ticket_id")
+        or decision.get("status") != "BLOCKED"
+        or decision.get("terminal_decision")
+        != "return_to_phase_3_proposal_revision"
+        or decision.get("phase_5_authorized") is not False
+        or not isinstance(estimate_identity, Mapping)
+        or (
+            estimate_identity.get("path"),
+            estimate_identity.get("sha256"),
+        )
+        != (
+            manifest.get("phase_3_estimate_writeback_ref"),
+            manifest.get("phase_3_estimate_writeback_sha256"),
+        )
+        or not (direct_proposal_match or mapped_proposal_match)
+    ):
+        raise InputError("phase3-rebind lacks an exact retained return-to-Phase-3 decision")
+    if (
+        decision.get("audit_history_path") != audit_record.get("path")
+        or not isinstance(artifact_hashes, Mapping)
+        or artifact_hashes.get(audit_record.get("path")) != audit_record.get("sha256")
+    ):
+        raise InputError("phase3-rebind return decision does not bind its retained audit")
+    if not all(
+        _is_below(Path(cast(str, record["path"])), manifest_path.parent)
+        for record in (decision_record, audit_record)
+    ):
+        raise InputError("phase3-rebind return evidence escapes the session planning directory")
+    retained_paths = {
+        entry[key]
+        for entry in lineage
+        for key in ("return_to_phase_3_ref", "return_to_phase_3_audit_ref")
+    }
+    retained_hashes = {
+        entry[key]
+        for entry in lineage
+        for key in ("return_to_phase_3_sha256", "return_to_phase_3_audit_sha256")
+    }
+    if (
+        decision_record["path"] in retained_paths
+        or audit_record["path"] in retained_paths
+        or decision_record["sha256"] in retained_hashes
+        or audit_record["sha256"] in retained_hashes
+    ):
+        raise InputError("phase3-rebind repeats retained return evidence")
+
+
+def _validate_phase3_revised_estimate(
+    manifest: Mapping[str, Any],
+    prior_estimate: Mapping[str, Any],
+    revised_estimate: Mapping[str, Any],
+    records: Mapping[str, Mapping[str, Any]],
+    lineage: Sequence[Mapping[str, Any]],
+    manifest_path: Path,
+    scratch_dir: Path,
+    next_attempt: int,
+) -> None:
+    estimate_record = records["phase-3-estimate-writeback"]
+    proposal_record = records["phase-3-proposal"]
+    prior_record = records["prior-phase-3-estimate-writeback"]
+    return_record = records["phase-4-return-decision"]
+    audit_record = records["phase-4-return-audit"]
+    if estimate_record.get("path") != str(
+        _phase3_estimate_path(manifest_path, cast(str, manifest["ticket_id"]), next_attempt)
+    ):
+        raise InputError("phase3-rebind revised estimate path is not attempt-versioned")
+    if proposal_record.get("path") != str(
+        _phase3_proposal_path(manifest_path, cast(str, manifest["ticket_id"]), next_attempt)
+    ):
+        raise InputError("phase3-rebind revised proposal path is not attempt-versioned")
+    expected_lineage = {
+        "phase_3_binding_attempt": next_attempt,
+        "prior_phase_3_estimate_writeback_ref": prior_record["path"],
+        "prior_phase_3_estimate_writeback_sha256": prior_record["sha256"],
+        "phase_4_return_to_phase_3_ref": return_record["path"],
+        "phase_4_return_to_phase_3_sha256": return_record["sha256"],
+        "phase_4_return_audit_ref": audit_record["path"],
+        "phase_4_return_audit_sha256": audit_record["sha256"],
+    }
+    stable_fields = (
+        "ticket_id",
+        "ticket_system",
+        "phase_0_ticket_snapshot_path",
+        "phase_0_ticket_snapshot_sha256",
+        "phase_0_ticket_snapshot_producing_invocation_uuid",
+        "resolved_operator_path",
+        "resolved_operator_sha256",
+        "resolved_operator_contract_path",
+        "resolved_contract_sha256",
+        "estimate_mutation_policy",
+        "estimate_field",
+        "cold_start_disposition_ref",
+        "disposition",
+    )
+    if (
+        revised_estimate.get("schema_version") != "phase-3-estimate-writeback-v1"
+        or any(revised_estimate.get(key) != value for key, value in expected_lineage.items())
+        or any(
+            revised_estimate.get(key) != prior_estimate.get(key)
+            for key in stable_fields
+        )
+    ):
+        raise InputError("phase3-rebind revised estimate lineage is malformed")
+    expected_disposition = {
+        "update_estimate_required": "write_verified",
+        "no_write_policy_disabled": "no_write_policy_disabled",
+    }.get(manifest.get("estimate_writeback_disposition"))
+    if expected_disposition is not None and revised_estimate.get("disposition") != expected_disposition:
+        raise InputError("phase3-rebind disposition does not match the current policy")
+    if (
+        revised_estimate.get("estimate_mutation_policy")
+        != manifest.get("estimate_mutation_policy")
+        or revised_estimate.get("estimate_field") != manifest.get("estimate_field")
+    ):
+        raise InputError("phase3-rebind estimate policy is not current")
+    if (
+        revised_estimate.get("phase_3_proposal_path") != proposal_record.get("path")
+        or revised_estimate.get("phase_3_proposal_sha256")
+        != proposal_record.get("sha256")
+    ):
+        raise InputError("phase3-rebind revised proposal identity is malformed")
+    retained_estimate_hashes = {
+        prior_record["sha256"],
+        *(entry["estimate_writeback_sha256"] for entry in lineage),
+    }
+    retained_proposal_hashes = {
+        prior_estimate.get("phase_3_proposal_sha256"),
+        *(entry["phase_3_proposal_sha256"] for entry in lineage),
+    }
+    if estimate_record["sha256"] in retained_estimate_hashes:
+        raise InputError("phase3-rebind requires byte-distinct revised estimate evidence")
+    if proposal_record["sha256"] in retained_proposal_hashes:
+        raise InputError("phase3-rebind requires byte-distinct revised proposal evidence")
+    currentness = revised_estimate.get("currentness")
+    currentness_fields = {
+        "phase_3_binding_attempt": next_attempt,
+        "phase_3_proposal_sha256": proposal_record["sha256"],
+        "prior_phase_3_estimate_writeback_sha256": prior_record["sha256"],
+        "phase_4_return_to_phase_3_sha256": return_record["sha256"],
+        "phase_4_return_audit_sha256": audit_record["sha256"],
+    }
+    if not isinstance(currentness, Mapping) or any(
+        currentness.get(key) != value for key, value in currentness_fields.items()
+    ):
+        raise InputError("phase3-rebind revised estimate currentness is incomplete")
+    _validate_phase3_artifact_bindings(
+        manifest, revised_estimate, records, scratch_dir, manifest_path.parent
+    )
+    _validate_phase3_disposition(
+        revised_estimate, records, revised_estimate.get("disposition")
+    )
+
+
+def _validate_phase3_rebind_history_transition(
+    source_manifest: Mapping[str, Any],
+    replacement_manifest: Mapping[str, Any],
+    manifest_path: Path,
+) -> None:
+    current_attempt, source_lineage = _validate_phase3_revision_state(
+        source_manifest, manifest_path
+    )
+    next_attempt, replacement_lineage = _validate_phase3_revision_state(
+        replacement_manifest, manifest_path
+    )
+    if next_attempt != current_attempt + 1:
+        raise InputError("phase3-rebind binding attempt is skipped or out of order")
+    source_history = cast(list[Any], source_manifest["phase_history"])
+    replacement_history = replacement_manifest.get("phase_history")
+    if (
+        not isinstance(replacement_history, list)
+        or replacement_history[:-1] != source_history
+        or len(replacement_history) != len(source_history) + 1
+    ):
+        raise InputError("phase3-rebind must append one exact lifecycle history entry")
+    _validate_canonical_phase3_rebind_history_entry(
+        replacement_history[-1], next_attempt
+    )
+    if replacement_lineage[:-1] != source_lineage:
+        raise InputError("phase3-rebind must preserve the complete revision lineage prefix")
+    appended = replacement_lineage[-1]
+    if (
+        appended["attempt"] != current_attempt
+        or appended["estimate_writeback_ref"]
+        != source_manifest["phase_3_estimate_writeback_ref"]
+        or appended["estimate_writeback_sha256"]
+        != source_manifest["phase_3_estimate_writeback_sha256"]
+    ):
+        raise InputError("phase3-rebind appended lineage does not preserve the prior binding")
+
+
+def _validate_phase3_revision_state(
+    manifest: Mapping[str, Any], manifest_path: Path
+) -> tuple[int, list[Mapping[str, Any]]]:
+    present = PHASE3_REVISION_FIELDS & set(manifest)
+    if present not in (set(), PHASE3_REVISION_FIELDS):
+        raise InputError("phase3-rebind revision state is partial")
+    if not present:
+        attempt = 1
+        lineage: list[Mapping[str, Any]] = []
+    else:
+        attempt_value = manifest.get("phase_3_binding_attempt")
+        lineage_value = manifest.get("phase_3_revision_history")
+        if (
+            isinstance(attempt_value, bool)
+            or not isinstance(attempt_value, int)
+            or attempt_value not in range(2, PHASE3_MAX_BINDING_ATTEMPT + 1)
+            or not isinstance(lineage_value, list)
+        ):
+            raise InputError("phase3-rebind revision attempt or history is malformed")
+        attempt = attempt_value
+        lineage = cast(list[Mapping[str, Any]], lineage_value)
+    if len(lineage) != attempt - 1:
+        raise InputError("phase3-rebind revision lineage length does not match the attempt")
+    for expected_attempt, entry in enumerate(lineage, start=1):
+        _validate_phase3_revision_entry(
+            entry,
+            manifest_path,
+            cast(str, manifest["ticket_id"]),
+            expected_attempt,
+        )
+    if attempt > 1 and manifest.get("phase_3_estimate_writeback_ref") != str(
+        _phase3_estimate_path(manifest_path, cast(str, manifest["ticket_id"]), attempt)
+    ):
+        raise InputError("phase3-rebind current estimate path does not match its attempt")
+    _require_sha256(
+        manifest.get("phase_3_estimate_writeback_sha256"),
+        "phase3-rebind current estimate",
+    )
+    _validate_phase3_revision_markers(manifest.get("phase_history"), attempt)
+    return attempt, lineage
+
+
+def _validate_phase3_revision_entry(
+    entry: Any, manifest_path: Path, ticket_id: str, expected_attempt: int
+) -> None:
+    if not isinstance(entry, dict) or set(entry) != PHASE3_REVISION_ENTRY_KEYS:
+        raise InputError("phase3-rebind revision history entry is malformed")
+    if entry.get("attempt") != expected_attempt:
+        raise InputError("phase3-rebind revision history attempts are not ordered")
+    for key in (
+        "estimate_writeback_sha256",
+        "phase_3_proposal_sha256",
+        "return_to_phase_3_sha256",
+        "return_to_phase_3_audit_sha256",
+    ):
+        _require_sha256(entry.get(key), f"phase3-rebind revision {key}")
+    for key in (
+        "estimate_writeback_ref",
+        "phase_3_proposal_path",
+        "return_to_phase_3_ref",
+        "return_to_phase_3_audit_ref",
+    ):
+        value = entry.get(key)
+        if (
+            not isinstance(value, str)
+            or not Path(value).is_absolute()
+            or value != os.path.normpath(value)
+            or not _is_below(Path(value), manifest_path.parent)
+        ):
+            raise InputError("phase3-rebind revision history path is noncanonical")
+    if expected_attempt > 1 and entry["estimate_writeback_ref"] != str(
+        _phase3_estimate_path(
+            manifest_path, ticket_id, expected_attempt
+        )
+    ):
+        raise InputError("phase3-rebind historical estimate path is not attempt-versioned")
+
+
+def _validate_phase3_revision_markers(value: Any, current_attempt: int) -> None:
+    history = _validate_pre_pr_history(value, allow_phase3=True)
+    markers = [entry for entry in history if _is_phase3_marker(entry["phase"])]
+    if len(markers) != current_attempt:
+        raise InputError("phase3-rebind lifecycle history does not match the binding attempt")
+    _validate_canonical_phase3_history_entry(markers[0])
+    previous = _phase3_history_time(markers[0])
+    for attempt, marker in enumerate(markers[1:], start=2):
+        _validate_canonical_phase3_rebind_history_entry(marker, attempt)
+        current = _phase3_history_time(marker)
+        if current <= previous:
+            raise InputError("phase3-rebind lifecycle timestamps are not monotonic")
+        previous = current
+    seen_phase3 = False
+    for entry in history:
+        if _is_phase3_marker(entry["phase"]):
+            seen_phase3 = True
+            continue
+        if seen_phase3 or entry["phase"] not in {"0", "1", "2", "2.5", "2.6"}:
+            raise InputError("phase3-rebind lifecycle history is diverted")
+
+
+def _validate_canonical_phase3_rebind_history_entry(entry: Any, attempt: int) -> None:
+    if (
+        not isinstance(entry, dict)
+        or set(entry) != {"attempt", "phase", "status", "ts"}
+        or entry.get("attempt") != attempt
+        or entry.get("phase") != "3"
+        or entry.get("status") != "rebound"
+    ):
+        raise InputError("phase3-rebind lifecycle history append is not canonical")
+    _phase3_history_time(entry)
+
+
+def _phase3_history_time(entry: Mapping[str, Any]) -> datetime:
+    try:
+        parsed = datetime.strptime(cast(str, entry["ts"]), "%Y-%m-%dT%H:%M:%SZ")
+    except (KeyError, TypeError, ValueError) as exc:
+        raise InputError("Phase 3 history timestamp is malformed") from exc
+    if parsed.strftime("%Y-%m-%dT%H:%M:%SZ") != entry["ts"]:
+        raise InputError("Phase 3 history timestamp is not canonical UTC")
+    return parsed
+
+
+def _phase3_estimate_path(manifest_path: Path, ticket_id: str, attempt: int) -> Path:
+    return (
+        manifest_path.parent
+        / "risk"
+        / f"{ticket_id.lower()}-phase-3-estimate-writeback-attempt-{attempt}.json"
+    )
+
+
+def _phase3_proposal_path(manifest_path: Path, ticket_id: str, attempt: int) -> Path:
+    return (
+        manifest_path.parent
+        / "proposals"
+        / f"{ticket_id.lower()}-{ticket_id}-attempt-{attempt}.md"
+    )
 
 
 def _validate_phase3_artifact_bindings(
@@ -3216,16 +3822,19 @@ def _validate_phase3_disposition(
     estimate: Mapping[str, Any],
     records: Mapping[str, Mapping[str, Any]],
     disposition: Any,
+    *,
+    evidence_role: str = "write-verification-evidence",
 ) -> None:
     if disposition == "write_verified":
         evidence = estimate.get("write_verification_evidence")
         currentness = cast(Mapping[str, Any], estimate["currentness"])
-        record = records["write-verification-evidence"]
+        record = records.get(evidence_role)
         if (
             estimate.get("update_estimate_dispatch_expected") is not True
             or estimate.get("update_estimate_dispatch_executed") is not True
             or not isinstance(evidence, dict)
             or evidence.get("status") != "PASS"
+            or record is None
             or evidence.get("path") != record.get("path")
             or evidence.get("sha256") != record.get("sha256")
             or currentness.get("write_verification_sha256") != record.get("sha256")

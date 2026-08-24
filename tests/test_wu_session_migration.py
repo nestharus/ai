@@ -824,6 +824,7 @@ def _runtime_case(
         "ticket_id": "AGE-260",
         "ticket_system": "linear",
         "disposition": "write_verified",
+        "estimate_field": "estimate",
         "cold_start_disposition_ref": str(cold_start_path),
         "phase_0_ticket_snapshot_path": str(ticket_snapshot),
         "phase_0_ticket_snapshot_sha256": _digest(ticket_snapshot.read_bytes()),
@@ -867,6 +868,7 @@ def _runtime_case(
         "phase0-reresolve",
         "cold-start-disposition-bind",
         "phase3-bind",
+        "phase3-rebind",
         "phase7-upsert",
         "phase9-update",
         "resumer-update",
@@ -948,6 +950,33 @@ def _runtime_case(
                 identity = None
                 artifacts = {"cold-start-disposition": cold_start_path}
             elif operation == "phase3-bind":
+                if target_operation == "phase3-rebind":
+                    estimate.update(
+                        {
+                            "disposition": "no_write_policy_disabled",
+                            "estimate_mutation_policy": current_manifest[
+                                "estimate_mutation_policy"
+                            ],
+                            "update_estimate_dispatch_expected": False,
+                            "update_estimate_dispatch_executed": False,
+                            "update_estimate_prompt_path": None,
+                            "update_estimate_prompt_sha256": None,
+                            "update_estimate_log_path": None,
+                            "update_estimate_log_sha256": None,
+                            "update_estimate_invocation_uuid": None,
+                            "write_verification_evidence": None,
+                        }
+                    )
+                    estimate["currentness"]["disposition"] = (
+                        "no_write_policy_disabled"
+                    )
+                    estimate["currentness"]["estimate_mutation_policy"] = (
+                        current_manifest["estimate_mutation_policy"]
+                    )
+                    estimate["currentness"]["write_verification_sha256"] = None
+                    _write_json(estimate_path, estimate)
+                    phase3_artifacts = dict(phase3_artifacts)
+                    phase3_artifacts.pop("write-verification-evidence")
                 replacement_manifest.update(
                     {
                         "phase_3_estimate_writeback_ref": str(estimate_path),
@@ -966,6 +995,21 @@ def _runtime_case(
                 replacement_index = json.loads(active_path.read_text())
                 identity = None
                 artifacts = phase3_artifacts
+            elif operation == "phase3-rebind":
+                if target_operation != "phase3-rebind":
+                    continue
+                return _next_phase3_rebind_case(
+                    {
+                        "operation": operation,
+                        "request_dir": request_dir,
+                        "project_planning_root": project_planning_root,
+                        "planning_root": planning_root,
+                        "manifest_path": manifest_path,
+                        "index_path": index_path,
+                        "direct_index_path": direct_index_path,
+                        "repo_root": repo_root,
+                    }
+                )
             elif operation == "phase7-upsert":
                 replacement_manifest.update(
                     {
@@ -1049,6 +1093,220 @@ def _runtime_case(
             }
         MIGRATION.apply_runtime_request(request_path, operation)
     raise AssertionError(target_operation)
+
+
+def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
+    manifest_path = case["manifest_path"]
+    index_path = case["index_path"]
+    source_manifest = json.loads(manifest_path.read_text())
+    current_attempt = source_manifest.get("phase_3_binding_attempt", 1)
+    next_attempt = current_attempt + 1
+    ticket_id = source_manifest["ticket_id"]
+    planning_dir = manifest_path.parent
+    risk_dir = planning_dir / "risk"
+    proposal_dir = planning_dir / "proposals"
+    prior_estimate_path = Path(source_manifest["phase_3_estimate_writeback_ref"])
+    prior_estimate = json.loads(prior_estimate_path.read_text())
+    prior_proposal_path = Path(prior_estimate["phase_3_proposal_path"])
+
+    audit_path = risk_dir / f"phase-4-attempt-{current_attempt}-audit-history.md"
+    audit_path.write_text(f"attempt: {current_attempt}\ndecision: return_to_phase_3\n")
+    return_path = risk_dir / f"phase-4-attempt-{current_attempt}-return-decision.json"
+    _write_json(
+        return_path,
+        {
+            "schema": "apply-gate-set-result-v1",
+            "ticket_id": ticket_id,
+            "status": "BLOCKED",
+            "terminal_decision": "return_to_phase_3_proposal_revision",
+            "phase_5_authorized": False,
+            "estimate_disposition": {
+                "path": str(prior_estimate_path),
+                "sha256": _digest(prior_estimate_path.read_bytes()),
+            },
+            "phase_3_proposal": {
+                "path": str(prior_proposal_path),
+                "sha256": _digest(prior_proposal_path.read_bytes()),
+            },
+            "audit_history_path": str(audit_path),
+            "artifact_sha256": {
+                str(prior_proposal_path): _digest(prior_proposal_path.read_bytes()),
+                str(audit_path): _digest(audit_path.read_bytes()),
+            },
+        },
+    )
+
+    revised_proposal_path = (
+        proposal_dir / f"{ticket_id.lower()}-{ticket_id}-attempt-{next_attempt}.md"
+    )
+    revised_proposal_path.write_text(
+        f"# Proposal attempt {next_attempt}\n\nSubstantive revision {next_attempt}.\n"
+    )
+    revised_estimate_path = (
+        risk_dir
+        / f"{ticket_id.lower()}-phase-3-estimate-writeback-attempt-{next_attempt}.json"
+    )
+    revised_estimate = copy.deepcopy(prior_estimate)
+    revised_estimate.update(
+        {
+            "phase_3_binding_attempt": next_attempt,
+            "prior_phase_3_estimate_writeback_ref": str(prior_estimate_path),
+            "prior_phase_3_estimate_writeback_sha256": _digest(
+                prior_estimate_path.read_bytes()
+            ),
+            "phase_4_return_to_phase_3_ref": str(return_path),
+            "phase_4_return_to_phase_3_sha256": _digest(return_path.read_bytes()),
+            "phase_4_return_audit_ref": str(audit_path),
+            "phase_4_return_audit_sha256": _digest(audit_path.read_bytes()),
+            "phase_3_proposal_path": str(revised_proposal_path),
+            "phase_3_proposal_sha256": _digest(revised_proposal_path.read_bytes()),
+            "phase_3_proposal_producing_invocation_uuid": (
+                f"30000000-0000-4000-8000-{next_attempt:012d}"
+            ),
+        }
+    )
+    revised_estimate["currentness"].update(
+        {
+            "phase_3_binding_attempt": next_attempt,
+            "phase_3_proposal_sha256": _digest(revised_proposal_path.read_bytes()),
+            "prior_phase_3_estimate_writeback_sha256": _digest(
+                prior_estimate_path.read_bytes()
+            ),
+            "phase_4_return_to_phase_3_sha256": _digest(return_path.read_bytes()),
+            "phase_4_return_audit_sha256": _digest(audit_path.read_bytes()),
+        }
+    )
+    revised_verification_path: Path | None = None
+    if revised_estimate["disposition"] == "write_verified":
+        revised_verification_path = (
+            Path(source_manifest["scratch_dir"])
+            / "ticket-operations"
+            / f"estimate-readback-attempt-{next_attempt}.json"
+        )
+        _write_json(
+            revised_verification_path,
+            {"status": "PASS", "estimate": 8, "attempt": next_attempt},
+        )
+        revised_estimate["write_verification_evidence"] = {
+            "status": "PASS",
+            "path": str(revised_verification_path),
+            "sha256": _digest(revised_verification_path.read_bytes()),
+        }
+        revised_estimate["currentness"]["write_verification_sha256"] = _digest(
+            revised_verification_path.read_bytes()
+        )
+    _write_json(revised_estimate_path, revised_estimate)
+
+    artifacts = {
+        "phase-0-ticket-snapshot": Path(revised_estimate["phase_0_ticket_snapshot_path"]),
+        "phase-3-estimate-writeback": revised_estimate_path,
+        "phase-3-proposal": revised_proposal_path,
+        "phase-4-return-audit": audit_path,
+        "phase-4-return-decision": return_path,
+        "prior-phase-3-estimate-writeback": prior_estimate_path,
+        "prior-phase-3-proposal": prior_proposal_path,
+        "resolved-ticket-contract": Path(
+            revised_estimate["resolved_operator_contract_path"]
+        ),
+        "resolved-ticket-operator": Path(revised_estimate["resolved_operator_path"]),
+    }
+    cold_start_ref = revised_estimate.get("cold_start_disposition_ref")
+    if cold_start_ref is not None:
+        artifacts["cold-start-disposition"] = Path(cold_start_ref)
+    prior_verification = prior_estimate.get("write_verification_evidence")
+    if isinstance(prior_verification, dict):
+        artifacts["prior-write-verification-evidence"] = Path(
+            prior_verification["path"]
+        )
+    if revised_verification_path is not None:
+        artifacts["write-verification-evidence"] = revised_verification_path
+    reresolve_readback = (
+        Path(source_manifest["scratch_dir"])
+        / "session-writes"
+        / "phase0-reresolve.readback.json"
+    )
+    if reresolve_readback.is_file():
+        artifacts["phase-0-reresolve-readback"] = reresolve_readback
+    for entry in source_manifest.get("phase_3_revision_history", []):
+        attempt = entry["attempt"]
+        artifacts.update(
+            {
+                f"lineage-estimate-writeback-attempt-{attempt}": Path(
+                    entry["estimate_writeback_ref"]
+                ),
+                f"lineage-phase-3-proposal-attempt-{attempt}": Path(
+                    entry["phase_3_proposal_path"]
+                ),
+                f"lineage-return-audit-attempt-{attempt}": Path(
+                    entry["return_to_phase_3_audit_ref"]
+                ),
+                f"lineage-return-decision-attempt-{attempt}": Path(
+                    entry["return_to_phase_3_ref"]
+                ),
+            }
+        )
+
+    replacement_manifest = copy.deepcopy(source_manifest)
+    replacement_manifest.update(
+        {
+            "phase_3_estimate_writeback_ref": str(revised_estimate_path),
+            "phase_3_estimate_writeback_sha256": _digest(
+                revised_estimate_path.read_bytes()
+            ),
+            "phase_3_binding_attempt": next_attempt,
+            "phase_3_revision_history": source_manifest.get(
+                "phase_3_revision_history", []
+            )
+            + [
+                {
+                    "attempt": current_attempt,
+                    "estimate_writeback_ref": str(prior_estimate_path),
+                    "estimate_writeback_sha256": _digest(
+                        prior_estimate_path.read_bytes()
+                    ),
+                    "phase_3_proposal_path": str(prior_proposal_path),
+                    "phase_3_proposal_sha256": _digest(
+                        prior_proposal_path.read_bytes()
+                    ),
+                    "return_to_phase_3_ref": str(return_path),
+                    "return_to_phase_3_sha256": _digest(return_path.read_bytes()),
+                    "return_to_phase_3_audit_ref": str(audit_path),
+                    "return_to_phase_3_audit_sha256": _digest(
+                        audit_path.read_bytes()
+                    ),
+                }
+            ],
+            "phase_history": source_manifest["phase_history"]
+            + [
+                {
+                    "attempt": next_attempt,
+                    "phase": "3",
+                    "status": "rebound",
+                    "ts": f"2026-07-{19 + next_attempt:02d}T00:00:00Z",
+                }
+            ],
+        }
+    )
+    replacement_index = json.loads(index_path.read_text())
+    request_path = _write_runtime_request(
+        case["request_dir"] / f"phase3-rebind-attempt-{next_attempt}.json",
+        "phase3-rebind",
+        case["planning_root"],
+        manifest_path,
+        index_path,
+        replacement_manifest,
+        replacement_index,
+        None,
+        artifacts,
+    )
+    return {
+        **case,
+        "operation": "phase3-rebind",
+        "request_path": request_path,
+        "replacement_manifest": replacement_manifest,
+        "replacement_index": replacement_index,
+        "artifacts": artifacts,
+    }
 
 
 def _rewrite_phase3_request(
@@ -2252,6 +2510,255 @@ def _pre_pr_readback(case: dict[str, Any], source_manifest: dict[str, Any]) -> d
         "journal_retained": False,
         "verdict": "PASS",
     }
+
+
+def test_phase3_rebind_attempt_one_to_two_changes_exact_keys_and_passes_readback(
+    tmp_path: Path,
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    source_manifest = json.loads(case["manifest_path"].read_text())
+    index_bytes = case["index_path"].read_bytes()
+    index_stat = case["index_path"].stat()
+    retained_paths = [
+        case["artifacts"][role]
+        for role in (
+            "prior-phase-3-estimate-writeback",
+            "prior-phase-3-proposal",
+            "phase-4-return-decision",
+            "phase-4-return-audit",
+        )
+    ]
+    retained_before = {
+        path: (path.read_bytes(), path.stat().st_ino) for path in retained_paths
+    }
+    extra_phase4 = case["manifest_path"].parent / "risk" / "retained-phase-4-row.md"
+    extra_phase4.write_text("PHASE4_ROW: HIGH\n")
+    extra_before = (extra_phase4.read_bytes(), extra_phase4.stat().st_ino)
+
+    MIGRATION.apply_runtime_request(case["request_path"], case["operation"])
+
+    current = json.loads(case["manifest_path"].read_text())
+    changed = {
+        key
+        for key in set(source_manifest) | set(current)
+        if source_manifest.get(key) != current.get(key)
+    }
+    assert changed == MIGRATION.RUNTIME_ALLOWED_MANIFEST_CHANGES["phase3-rebind"]
+    assert current["phase_3_binding_attempt"] == 2
+    assert current["phase_3_revision_history"] == [
+        {
+            "attempt": 1,
+            "estimate_writeback_ref": str(
+                case["artifacts"]["prior-phase-3-estimate-writeback"]
+            ),
+            "estimate_writeback_sha256": _digest(
+                case["artifacts"]["prior-phase-3-estimate-writeback"].read_bytes()
+            ),
+            "phase_3_proposal_path": str(
+                case["artifacts"]["prior-phase-3-proposal"]
+            ),
+            "phase_3_proposal_sha256": _digest(
+                case["artifacts"]["prior-phase-3-proposal"].read_bytes()
+            ),
+            "return_to_phase_3_ref": str(
+                case["artifacts"]["phase-4-return-decision"]
+            ),
+            "return_to_phase_3_sha256": _digest(
+                case["artifacts"]["phase-4-return-decision"].read_bytes()
+            ),
+            "return_to_phase_3_audit_ref": str(
+                case["artifacts"]["phase-4-return-audit"]
+            ),
+            "return_to_phase_3_audit_sha256": _digest(
+                case["artifacts"]["phase-4-return-audit"].read_bytes()
+            ),
+        }
+    ]
+    assert all(
+        current[key] == value
+        for key, value in source_manifest.items()
+        if key not in changed
+    )
+    assert {
+        path: (path.read_bytes(), path.stat().st_ino) for path in retained_paths
+    } == retained_before
+    assert (extra_phase4.read_bytes(), extra_phase4.stat().st_ino) == extra_before
+    assert case["index_path"].read_bytes() == index_bytes
+    current_index_stat = case["index_path"].stat()
+    assert (
+        current_index_stat.st_dev,
+        current_index_stat.st_ino,
+        current_index_stat.st_mode,
+    ) == (index_stat.st_dev, index_stat.st_ino, index_stat.st_mode)
+    readback_path = tmp_path / "phase3-rebind-attempt-2.readback.json"
+    _write_json(readback_path, _pre_pr_readback(case, source_manifest))
+    MIGRATION.validate_pre_pr_readback(readback_path)
+    assert not MIGRATION._journal_path().exists()
+
+
+def test_phase3_rebind_attempt_two_to_three_preserves_lineage_and_enforces_cap(
+    tmp_path: Path,
+):
+    attempt_two = _runtime_case(tmp_path, "phase3-rebind")
+    source_one = json.loads(attempt_two["manifest_path"].read_text())
+    MIGRATION.apply_runtime_request(attempt_two["request_path"], "phase3-rebind")
+    attempt_three = _next_phase3_rebind_case(attempt_two)
+    source_two = json.loads(attempt_three["manifest_path"].read_text())
+    index_before = attempt_three["index_path"].read_bytes()
+    retained_before = {
+        path: path.read_bytes()
+        for path in attempt_three["artifacts"].values()
+        if "phase-3-estimate-writeback-attempt-3" not in path.name
+        and not path.name.endswith("attempt-3.md")
+    }
+
+    MIGRATION.apply_runtime_request(attempt_three["request_path"], "phase3-rebind")
+
+    current = json.loads(attempt_three["manifest_path"].read_text())
+    assert current["phase_3_binding_attempt"] == 3
+    assert [entry["attempt"] for entry in current["phase_3_revision_history"]] == [
+        1,
+        2,
+    ]
+    assert current["phase_3_revision_history"][:-1] == source_two[
+        "phase_3_revision_history"
+    ]
+    assert source_two["phase_3_revision_history"][0]["estimate_writeback_ref"] == (
+        source_one["phase_3_estimate_writeback_ref"]
+    )
+    assert attempt_three["index_path"].read_bytes() == index_before
+    assert all(path.read_bytes() == payload for path, payload in retained_before.items())
+    readback_path = tmp_path / "phase3-rebind-attempt-3.readback.json"
+    _write_json(readback_path, _pre_pr_readback(attempt_three, source_two))
+    MIGRATION.validate_pre_pr_readback(readback_path)
+
+    capped = _next_phase3_rebind_case(attempt_three)
+    before_cap = capped["manifest_path"].read_bytes()
+    with pytest.raises(InputError, match="three-attempt cap"):
+        MIGRATION.apply_runtime_request(capped["request_path"], "phase3-rebind")
+    assert capped["manifest_path"].read_bytes() == before_cap
+    assert not MIGRATION._journal_path().exists()
+
+
+@pytest.mark.parametrize(
+    ("mutation", "error_type", "message"),
+    [
+        ("replay", InputError, "exact revision projection"),
+        ("skip", InputError, "revision lineage length"),
+        ("stale-source", ApplyError, "stale runtime manifest"),
+        ("stale-artifact", ApplyError, "stale runtime artifact"),
+        ("extra-key", InputError, "exact revision projection"),
+        ("changed-index", InputError, "cannot change the active index"),
+        ("malformed-history", InputError, "history attempts are not ordered"),
+        ("missing-prior", InputError, "path is missing"),
+        ("aliased-prior", InputError, "duplicate device/inode alias"),
+    ],
+)
+def test_phase3_rebind_refusal_matrix_is_non_mutating(
+    mutation: str,
+    error_type: type[Exception],
+    message: str,
+    tmp_path: Path,
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    request = json.loads(case["request_path"].read_text())
+    if mutation == "replay":
+        current = json.loads(case["manifest_path"].read_text())
+        request_path = _write_runtime_request(
+            tmp_path / "requests" / "phase3-rebind-replay.json",
+            "phase3-rebind",
+            case["planning_root"],
+            case["manifest_path"],
+            case["index_path"],
+            current,
+            json.loads(case["index_path"].read_text()),
+            None,
+            case["artifacts"],
+        )
+    else:
+        request_path = case["request_path"]
+        if mutation == "skip":
+            request["replacement_manifest"]["phase_3_binding_attempt"] = 3
+        elif mutation == "stale-source":
+            request["sources"]["manifest"]["sha256"] = "0" * 64
+        elif mutation == "stale-artifact":
+            request["sources"]["artifacts"][0]["sha256"] = "0" * 64
+        elif mutation == "extra-key":
+            request["replacement_manifest"]["unexpected"] = True
+        elif mutation == "changed-index":
+            request["replacement_index"]["reviewed_inventory_sha256"] = "0" * 64
+        elif mutation == "malformed-history":
+            request["replacement_manifest"]["phase_3_revision_history"][-1][
+                "attempt"
+            ] = 2
+        elif mutation == "missing-prior":
+            case["artifacts"]["prior-phase-3-proposal"].unlink()
+        else:
+            original = case["artifacts"]["prior-phase-3-proposal"]
+            alias = original.with_name("prior-proposal-alias.md")
+            os.link(original, alias)
+            request["sources"]["artifacts"].append(
+                {
+                    "role": "retained-prior-proposal-alias",
+                    "path": str(alias),
+                    **{
+                        key: value
+                        for key, value in MIGRATION.runtime_source_identity(alias).items()
+                        if key != "exists"
+                    },
+                }
+            )
+            request["sources"]["artifacts"].sort(
+                key=lambda record: (record["role"], record["path"])
+            )
+        _resign_runtime_request(request_path, request)
+    manifest_before = case["manifest_path"].read_bytes()
+    index_before = case["index_path"].read_bytes()
+
+    with pytest.raises(error_type, match=message):
+        MIGRATION.apply_runtime_request(request_path, "phase3-rebind")
+
+    assert case["manifest_path"].read_bytes() == manifest_before
+    assert case["index_path"].read_bytes() == index_before
+    assert not MIGRATION._journal_path().exists()
+
+
+def test_phase3_rebind_rejects_lifecycle_diversion(tmp_path: Path):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    source = json.loads(case["manifest_path"].read_text())
+    source["draft_pr_url"] = "https://github.com/example/repo/pull/260"
+    _write_json(case["manifest_path"], source)
+    diverted = _next_phase3_rebind_case(case)
+    before = diverted["manifest_path"].read_bytes()
+
+    with pytest.raises(InputError, match="bound lifecycle field"):
+        MIGRATION.apply_runtime_request(diverted["request_path"], "phase3-rebind")
+
+    assert diverted["manifest_path"].read_bytes() == before
+    assert not MIGRATION._journal_path().exists()
+
+
+def test_phase3_rebind_transaction_fault_restores_manifest_and_guards(tmp_path: Path):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    manifest_before = case["manifest_path"].read_bytes()
+    index_before = case["index_path"].read_bytes()
+    artifacts_before = {
+        path: path.read_bytes() for path in case["artifacts"].values()
+    }
+
+    def fail(point: str, index: int) -> None:
+        if (point, index) == ("commit-parent-fsync", 0):
+            raise OSError("phase3-rebind transaction fault")
+
+    setattr(MIGRATION, "FAULT_HOOK", fail)
+    with pytest.raises(ApplyError, match="rolled back"):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+    setattr(MIGRATION, "FAULT_HOOK", None)
+
+    assert case["manifest_path"].read_bytes() == manifest_before
+    assert case["index_path"].read_bytes() == index_before
+    assert all(path.read_bytes() == payload for path, payload in artifacts_before.items())
+    assert not MIGRATION._journal_path().exists()
 
 
 def test_phase0_reresolve_applies_policy_and_passes_closed_readback(tmp_path: Path):
