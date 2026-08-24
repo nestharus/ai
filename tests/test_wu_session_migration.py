@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import importlib.util
+import inspect
 import json
 import os
 import copy
@@ -14,6 +15,7 @@ import pytest
 
 
 TOOL_DIR = Path(__file__).resolve().parents[1] / "tools" / "wu-session-migration"
+REAL_TOOL_DIR = TOOL_DIR
 SPEC = importlib.util.spec_from_file_location(
     "wu_session_migration", TOOL_DIR / "wu_session_migration.py"
 )
@@ -52,10 +54,26 @@ GIT_ENV = {
 
 @pytest.fixture(autouse=True)
 def isolated_transaction_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
-    monkeypatch.setenv("WU_SESSION_MIGRATION_STATE_DIR", str(tmp_path / "transaction-state"))
+    global TOOL_DIR
+    state_root = tmp_path / "transaction-state"
+    setattr(MIGRATION, "_TEST_STATE_ROOT", state_root)
+    wrapper = tmp_path / "wu-session-migration-test-entry.py"
+    wrapper.write_text(
+        "import importlib.util, pathlib, sys\n"
+        f"source = pathlib.Path({str(REAL_TOOL_DIR / 'wu_session_migration.py')!r})\n"
+        "spec = importlib.util.spec_from_file_location('wu_session_migration_test_cli', source)\n"
+        "module = importlib.util.module_from_spec(spec)\n"
+        "spec.loader.exec_module(module)\n"
+        f"module._TEST_STATE_ROOT = pathlib.Path({str(state_root)!r})\n"
+        "raise SystemExit(module.main())\n"
+    )
+    TOOL_DIR = wrapper
+    monkeypatch.delenv("WU_SESSION_MIGRATION_STATE_DIR", raising=False)
     setattr(MIGRATION, "FAULT_HOOK", None)
     yield
     setattr(MIGRATION, "FAULT_HOOK", None)
+    setattr(MIGRATION, "_TEST_STATE_ROOT", None)
+    TOOL_DIR = REAL_TOOL_DIR
 
 
 def _json_bytes(value: object) -> bytes:
@@ -1109,30 +1127,140 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
     prior_estimate = json.loads(prior_estimate_path.read_text())
     prior_proposal_path = Path(prior_estimate["phase_3_proposal_path"])
 
-    audit_path = risk_dir / f"phase-4-attempt-{current_attempt}-audit-history.md"
-    audit_path.write_text(f"attempt: {current_attempt}\ndecision: return_to_phase_3\n")
+    audit_path = planning_dir / "audit-history.md"
+    with audit_path.open("a", encoding="utf-8") as audit:
+        audit.write(f"attempt: {current_attempt}\ndecision: return_to_phase_3\n")
+    audit_snapshot_path = MIGRATION._phase4_audit_snapshot_path(
+        manifest_path, current_attempt
+    )
+    audit_snapshot_path.write_bytes(audit_path.read_bytes())
+    phase4_outputs = {
+        "phase-4-dispatch-manifest": risk_dir
+        / f"phase-4-attempt-{current_attempt}-dispatch-manifest.json",
+        "phase-4-join-manifest": risk_dir
+        / f"phase-4-attempt-{current_attempt}-join-manifest.json",
+        "phase-4-aggregate-report": risk_dir
+        / f"phase-4-attempt-{current_attempt}-aggregate.md",
+        "phase-4-expected-process": risk_dir
+        / f"phase-4-attempt-{current_attempt}-expected-process.json",
+        "phase-4-process-tree-report": risk_dir
+        / f"phase-4-attempt-{current_attempt}-process-tree-report.md",
+        "phase-4-process-tree": risk_dir
+        / f"phase-4-attempt-{current_attempt}-process-tree.json",
+    }
+    for role, path in phase4_outputs.items():
+        if role != "phase-4-process-tree-report":
+            path.write_text(f"{role}: attempt {current_attempt}\n")
     return_path = risk_dir / f"phase-4-attempt-{current_attempt}-return-decision.json"
+    cycle_id = f"{ticket_id.lower()}-phase-4-attempt-{current_attempt}"
+    artifact_sha256 = {
+        str(prior_estimate_path): _digest(prior_estimate_path.read_bytes()),
+        str(prior_proposal_path): _digest(prior_proposal_path.read_bytes()),
+        str(audit_path): _digest(audit_path.read_bytes()),
+        **{
+            str(path): _digest(path.read_bytes()) if path.is_file() else None
+            for path in phase4_outputs.values()
+        },
+    }
     _write_json(
         return_path,
         {
             "schema": "apply-gate-set-result-v1",
+            "caller_mode": "implementation-phase-4",
             "ticket_id": ticket_id,
+            "cycle_id": cycle_id,
             "status": "BLOCKED",
+            "semantic_disposition": "HIGH",
+            "terminal_disposition": "PROCESS_AUDIT_INVALID",
             "terminal_decision": "return_to_phase_3_proposal_revision",
             "phase_5_authorized": False,
+            "repository_root": source_manifest["repo_root"],
+            "worktree_path": source_manifest["worktree_path"],
+            "workflow_stop_reason": "Phase 4 has blocking semantic evidence.",
+            "next_action": "Revise the proposal and start a fresh Phase 4 attempt.",
+            "repair_route": {
+                "destination": "implementation_phase_3_proposal_revision",
+                "semantic_findings": ["R1-F01"],
+                "process_finding": "R1-F02",
+                "forbidden_actions": ["phase_5_advancement"],
+            },
             "estimate_disposition": {
                 "path": str(prior_estimate_path),
                 "sha256": _digest(prior_estimate_path.read_bytes()),
+                "disposition": "no_write_policy_disabled",
+                "estimate_mutation_enabled": False,
+                "update_estimate_dispatch_executed": False,
             },
-            "phase_3_proposal": {
-                "path": str(prior_proposal_path),
-                "sha256": _digest(prior_proposal_path.read_bytes()),
+            "gate_results": [
+                {
+                    "id": "proposal-risk",
+                    "verdict": "HIGH",
+                    "path": str(phase4_outputs["phase-4-aggregate-report"]),
+                    "sha256": _digest(
+                        phase4_outputs["phase-4-aggregate-report"].read_bytes()
+                    ),
+                    "blocking": True,
+                }
+            ],
+            "process_proof": {
+                "status": "PROCESS_AUDIT_INVALID",
+                "mode": "blocking",
+                "expected_process_path": str(
+                    phase4_outputs["phase-4-expected-process"]
+                ),
+                "expected_process_sha256": _digest(
+                    phase4_outputs["phase-4-expected-process"].read_bytes()
+                ),
+                "process_tree_report_path": str(
+                    phase4_outputs["phase-4-process-tree-report"]
+                ),
+                "process_tree_report_sha256": None,
+                "process_tree_path": str(phase4_outputs["phase-4-process-tree"]),
+                "process_tree_sha256": _digest(
+                    phase4_outputs["phase-4-process-tree"].read_bytes()
+                ),
+                "auditor_verdict": None,
             },
             "audit_history_path": str(audit_path),
-            "artifact_sha256": {
-                str(prior_proposal_path): _digest(prior_proposal_path.read_bytes()),
-                str(audit_path): _digest(audit_path.read_bytes()),
+            "dispatch_manifest_path": str(
+                phase4_outputs["phase-4-dispatch-manifest"]
+            ),
+            "join_manifest_path": str(phase4_outputs["phase-4-join-manifest"]),
+            "aggregate_report_path": str(
+                phase4_outputs["phase-4-aggregate-report"]
+            ),
+            "expected_process_path": str(
+                phase4_outputs["phase-4-expected-process"]
+            ),
+            "process_tree_report_path": str(
+                phase4_outputs["phase-4-process-tree-report"]
+            ),
+            "process_tree_path": str(phase4_outputs["phase-4-process-tree"]),
+            "result_path": str(return_path),
+            "blocking_rows": ["proposal-risk"],
+            "exception_rows": [],
+            "inventory_resolution_rows": [],
+            "skip_rows": [],
+            "stale_refusal_rows": [],
+            "currentness_key_summary": {
+                "cycle_id": cycle_id,
+                "caller_mode": "implementation-phase-4",
+                "base_ref_matches": True,
+                "base_sha_matches": True,
+                "head_ref_matches": True,
+                "head_sha_matches": True,
+                "proposal_hash_matches": True,
+                "canonical_gate_hashes_match": True,
+                "currentness_disposition": "current_non_accepting",
             },
+            "base_branch": source_manifest["base_branch"],
+            "base_ref": "refs/remotes/origin/main",
+            "base_sha": A,
+            "head_branch": source_manifest["branch"],
+            "head_ref": f"refs/heads/{source_manifest['branch']}",
+            "head_sha": source_manifest["branch_out_sha"],
+            "diff_sha256": "d" * 64,
+            "artifact_sha256": artifact_sha256,
         },
     )
 
@@ -1156,8 +1284,10 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
             ),
             "phase_4_return_to_phase_3_ref": str(return_path),
             "phase_4_return_to_phase_3_sha256": _digest(return_path.read_bytes()),
-            "phase_4_return_audit_ref": str(audit_path),
-            "phase_4_return_audit_sha256": _digest(audit_path.read_bytes()),
+            "phase_4_return_audit_ref": str(audit_snapshot_path),
+            "phase_4_return_audit_sha256": _digest(
+                audit_snapshot_path.read_bytes()
+            ),
             "phase_3_proposal_path": str(revised_proposal_path),
             "phase_3_proposal_sha256": _digest(revised_proposal_path.read_bytes()),
             "phase_3_proposal_producing_invocation_uuid": (
@@ -1173,7 +1303,9 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
                 prior_estimate_path.read_bytes()
             ),
             "phase_4_return_to_phase_3_sha256": _digest(return_path.read_bytes()),
-            "phase_4_return_audit_sha256": _digest(audit_path.read_bytes()),
+            "phase_4_return_audit_sha256": _digest(
+                audit_snapshot_path.read_bytes()
+            ),
         }
     )
     revised_verification_path: Path | None = None
@@ -1201,7 +1333,8 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
         "phase-0-ticket-snapshot": Path(revised_estimate["phase_0_ticket_snapshot_path"]),
         "phase-3-estimate-writeback": revised_estimate_path,
         "phase-3-proposal": revised_proposal_path,
-        "phase-4-return-audit": audit_path,
+        "phase-4-return-audit": audit_snapshot_path,
+        "phase-4-canonical-audit": audit_path,
         "phase-4-return-decision": return_path,
         "prior-phase-3-estimate-writeback": prior_estimate_path,
         "prior-phase-3-proposal": prior_proposal_path,
@@ -1209,6 +1342,7 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
             revised_estimate["resolved_operator_contract_path"]
         ),
         "resolved-ticket-operator": Path(revised_estimate["resolved_operator_path"]),
+        **{role: path for role, path in phase4_outputs.items() if path.is_file()},
     }
     cold_start_ref = revised_estimate.get("cold_start_disposition_ref")
     if cold_start_ref is not None:
@@ -1270,9 +1404,9 @@ def _next_phase3_rebind_case(case: dict[str, Any]) -> dict[str, Any]:
                     ),
                     "return_to_phase_3_ref": str(return_path),
                     "return_to_phase_3_sha256": _digest(return_path.read_bytes()),
-                    "return_to_phase_3_audit_ref": str(audit_path),
+                    "return_to_phase_3_audit_ref": str(audit_snapshot_path),
                     "return_to_phase_3_audit_sha256": _digest(
-                        audit_path.read_bytes()
+                        audit_snapshot_path.read_bytes()
                     ),
                 }
             ],
@@ -2512,6 +2646,60 @@ def _pre_pr_readback(case: dict[str, Any], source_manifest: dict[str, Any]) -> d
     }
 
 
+def _refresh_phase3_case_request(case: dict[str, Any]) -> None:
+    request = json.loads(case["request_path"].read_text())
+    request["sources"]["manifest"] = MIGRATION.runtime_source_identity(
+        case["manifest_path"]
+    )
+    request["sources"]["artifacts"] = [
+        {
+            "role": role,
+            "path": str(path),
+            **{
+                key: value
+                for key, value in MIGRATION.runtime_source_identity(path).items()
+                if key != "exists"
+            },
+        }
+        for role, path in sorted(case["artifacts"].items())
+    ]
+    request["replacement_manifest"] = case["replacement_manifest"]
+    _resign_runtime_request(case["request_path"], request)
+
+
+def _rewrite_phase4_result(
+    case: dict[str, Any], mutation: str
+) -> None:
+    result_path = case["artifacts"]["phase-4-return-decision"]
+    result = json.loads(result_path.read_text())
+    if mutation == "malformed":
+        result["blocking_rows"] = "proposal-risk"
+    elif mutation == "truncated":
+        result.pop("process_tree_report_path")
+    elif mutation == "wrong-context":
+        result["cycle_id"] = "wrong-phase-4-cycle"
+    elif mutation == "missing-gates":
+        result.pop("gate_results")
+    elif mutation == "malformed-process":
+        result["process_proof"]["expected_process_sha256"] = "0" * 64
+    else:
+        raise AssertionError(mutation)
+    _write_json(result_path, result)
+    result_sha256 = _digest(result_path.read_bytes())
+    revised_path = case["artifacts"]["phase-3-estimate-writeback"]
+    revised = json.loads(revised_path.read_text())
+    revised["phase_4_return_to_phase_3_sha256"] = result_sha256
+    revised["currentness"]["phase_4_return_to_phase_3_sha256"] = result_sha256
+    _write_json(revised_path, revised)
+    case["replacement_manifest"]["phase_3_estimate_writeback_sha256"] = _digest(
+        revised_path.read_bytes()
+    )
+    case["replacement_manifest"]["phase_3_revision_history"][-1][
+        "return_to_phase_3_sha256"
+    ] = result_sha256
+    _refresh_phase3_case_request(case)
+
+
 def test_phase3_rebind_attempt_one_to_two_changes_exact_keys_and_passes_readback(
     tmp_path: Path,
 ):
@@ -2519,15 +2707,7 @@ def test_phase3_rebind_attempt_one_to_two_changes_exact_keys_and_passes_readback
     source_manifest = json.loads(case["manifest_path"].read_text())
     index_bytes = case["index_path"].read_bytes()
     index_stat = case["index_path"].stat()
-    retained_paths = [
-        case["artifacts"][role]
-        for role in (
-            "prior-phase-3-estimate-writeback",
-            "prior-phase-3-proposal",
-            "phase-4-return-decision",
-            "phase-4-return-audit",
-        )
-    ]
+    retained_paths = list(case["artifacts"].values())
     retained_before = {
         path: (path.read_bytes(), path.stat().st_ino) for path in retained_paths
     }
@@ -2535,7 +2715,9 @@ def test_phase3_rebind_attempt_one_to_two_changes_exact_keys_and_passes_readback
     extra_phase4.write_text("PHASE4_ROW: HIGH\n")
     extra_before = (extra_phase4.read_bytes(), extra_phase4.stat().st_ino)
 
-    MIGRATION.apply_runtime_request(case["request_path"], case["operation"])
+    generated_readback = MIGRATION.apply_runtime_request(
+        case["request_path"], case["operation"]
+    )
 
     current = json.loads(case["manifest_path"].read_text())
     changed = {
@@ -2594,6 +2776,12 @@ def test_phase3_rebind_attempt_one_to_two_changes_exact_keys_and_passes_readback
     _write_json(readback_path, _pre_pr_readback(case, source_manifest))
     MIGRATION.validate_pre_pr_readback(readback_path)
     assert not MIGRATION._journal_path().exists()
+    assert generated_readback == (
+        Path(source_manifest["scratch_dir"])
+        / "session-writes"
+        / "phase3-rebind-attempt-2.readback.json"
+    )
+    assert generated_readback.is_file()
 
 
 def test_phase3_rebind_attempt_two_to_three_preserves_lineage_and_enforces_cap(
@@ -2611,6 +2799,12 @@ def test_phase3_rebind_attempt_two_to_three_preserves_lineage_and_enforces_cap(
         if "phase-3-estimate-writeback-attempt-3" not in path.name
         and not path.name.endswith("attempt-3.md")
     }
+    attempt_one_snapshot = attempt_three["artifacts"][
+        "lineage-return-audit-attempt-1"
+    ]
+    attempt_one_snapshot_before = attempt_one_snapshot.read_bytes()
+    canonical_audit = attempt_three["artifacts"]["phase-4-canonical-audit"]
+    assert canonical_audit.read_bytes() != attempt_one_snapshot_before
 
     MIGRATION.apply_runtime_request(attempt_three["request_path"], "phase3-rebind")
 
@@ -2628,6 +2822,7 @@ def test_phase3_rebind_attempt_two_to_three_preserves_lineage_and_enforces_cap(
     )
     assert attempt_three["index_path"].read_bytes() == index_before
     assert all(path.read_bytes() == payload for path, payload in retained_before.items())
+    assert attempt_one_snapshot.read_bytes() == attempt_one_snapshot_before
     readback_path = tmp_path / "phase3-rebind-attempt-3.readback.json"
     _write_json(readback_path, _pre_pr_readback(attempt_three, source_two))
     MIGRATION.validate_pre_pr_readback(readback_path)
@@ -2638,6 +2833,201 @@ def test_phase3_rebind_attempt_two_to_three_preserves_lineage_and_enforces_cap(
         MIGRATION.apply_runtime_request(capped["request_path"], "phase3-rebind")
     assert capped["manifest_path"].read_bytes() == before_cap
     assert not MIGRATION._journal_path().exists()
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "phase_3_proposal_path",
+        "phase_3_proposal_sha256",
+        "return_to_phase_3_ref",
+        "return_to_phase_3_sha256",
+        "return_to_phase_3_audit_ref",
+        "return_to_phase_3_audit_sha256",
+    ],
+)
+def test_phase3_rebind_rejects_appended_non_estimate_lineage_mismatch(
+    field: str, tmp_path: Path
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    request = json.loads(case["request_path"].read_text())
+    value = (
+        "0" * 64
+        if field.endswith("sha256")
+        else str(case["manifest_path"].parent / "risk" / f"wrong-{field}")
+    )
+    request["replacement_manifest"]["phase_3_revision_history"][-1][field] = value
+    _resign_runtime_request(case["request_path"], request)
+    before = case["manifest_path"].read_bytes()
+
+    with pytest.raises(InputError, match="appended lineage"):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+
+    assert case["manifest_path"].read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    ("mutation", "message"),
+    [
+        ("malformed", "return-to-Phase-3 decision"),
+        ("truncated", "return-to-Phase-3 decision"),
+        ("wrong-context", "return-to-Phase-3 decision"),
+        ("missing-gates", "return-to-Phase-3 decision"),
+        ("malformed-process", "process proof is stale"),
+    ],
+)
+def test_phase3_rebind_rejects_invalid_complete_phase4_producer_result(
+    mutation: str, message: str, tmp_path: Path
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    _rewrite_phase4_result(case, mutation)
+    before = case["manifest_path"].read_bytes()
+
+    with pytest.raises(InputError, match=message):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+
+    assert case["manifest_path"].read_bytes() == before
+
+
+def test_phase3_rebind_rejects_write_verified_revised_estimate(tmp_path: Path):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    revised_path = case["artifacts"]["phase-3-estimate-writeback"]
+    revised = json.loads(revised_path.read_text())
+    revised["disposition"] = "write_verified"
+    _write_json(revised_path, revised)
+    case["replacement_manifest"]["phase_3_estimate_writeback_sha256"] = _digest(
+        revised_path.read_bytes()
+    )
+    _refresh_phase3_case_request(case)
+
+    with pytest.raises(InputError, match="requires no_write_policy_disabled"):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+
+
+def test_phase3_rebind_rejects_write_verified_prior_estimate(tmp_path: Path):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    prior_path = case["artifacts"]["prior-phase-3-estimate-writeback"]
+    prior = json.loads(prior_path.read_text())
+    prior["disposition"] = "write_verified"
+    _write_json(prior_path, prior)
+    prior_sha256 = _digest(prior_path.read_bytes())
+    source = json.loads(case["manifest_path"].read_text())
+    source["phase_3_estimate_writeback_sha256"] = prior_sha256
+    _write_json(case["manifest_path"], source)
+    result_path = case["artifacts"]["phase-4-return-decision"]
+    result = json.loads(result_path.read_text())
+    result["estimate_disposition"]["sha256"] = prior_sha256
+    result["artifact_sha256"][str(prior_path)] = prior_sha256
+    _write_json(result_path, result)
+    result_sha256 = _digest(result_path.read_bytes())
+    revised_path = case["artifacts"]["phase-3-estimate-writeback"]
+    revised = json.loads(revised_path.read_text())
+    revised["prior_phase_3_estimate_writeback_sha256"] = prior_sha256
+    revised["currentness"]["prior_phase_3_estimate_writeback_sha256"] = prior_sha256
+    revised["phase_4_return_to_phase_3_sha256"] = result_sha256
+    revised["currentness"]["phase_4_return_to_phase_3_sha256"] = result_sha256
+    _write_json(revised_path, revised)
+    case["replacement_manifest"].update(
+        {
+            "phase_3_estimate_writeback_sha256": _digest(revised_path.read_bytes()),
+            "phase_3_revision_history": [
+                {
+                    **case["replacement_manifest"]["phase_3_revision_history"][-1],
+                    "estimate_writeback_sha256": prior_sha256,
+                    "return_to_phase_3_sha256": result_sha256,
+                }
+            ],
+        }
+    )
+    _refresh_phase3_case_request(case)
+
+    with pytest.raises(InputError, match="prior estimate must use no_write_policy_disabled"):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+
+
+@pytest.mark.parametrize("failure", ["publication", "validation"])
+def test_phase3_rebind_committed_awaiting_readback_is_never_pass(
+    failure: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    original_validator = MIGRATION._validate_pre_pr_readback_locked
+    if failure == "publication":
+        def fail(point: str, index: int) -> None:
+            if (point, index) == ("readback-write", 0):
+                raise OSError("readback publication fault")
+
+        setattr(MIGRATION, "FAULT_HOOK", fail)
+    else:
+        monkeypatch.setattr(
+            MIGRATION,
+            "_validate_pre_pr_readback_locked",
+            lambda *args, **kwargs: (_ for _ in ()).throw(InputError("readback invalid")),
+        )
+
+    with pytest.raises(
+        MIGRATION.CommittedAwaitingReadbackError,
+        match="committed-awaiting-readback",
+    ):
+        MIGRATION.apply_runtime_request(case["request_path"], "phase3-rebind")
+
+    assert json.loads(case["manifest_path"].read_text()) == case["replacement_manifest"]
+    assert not MIGRATION._journal_path().exists()
+    setattr(MIGRATION, "FAULT_HOOK", None)
+    monkeypatch.setattr(
+        MIGRATION, "_validate_pre_pr_readback_locked", original_validator
+    )
+
+    recovered_readback = MIGRATION.apply_runtime_request(
+        case["request_path"], "phase3-rebind"
+    )
+
+    assert recovered_readback is not None and recovered_readback.is_file()
+    MIGRATION.validate_pre_pr_readback(recovered_readback)
+
+
+def test_phase3_rebind_cli_prints_pass_only_with_valid_generated_readback(
+    tmp_path: Path,
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(TOOL_DIR),
+            "phase3-rebind",
+            "--request",
+            str(case["request_path"]),
+        ],
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "WU-SESSION-RUNTIME-WRITE: PASS" in completed.stdout
+    readback_path = Path(completed.stdout.strip().rsplit("readback=", 1)[1])
+    assert readback_path.is_file()
+    MIGRATION.validate_pre_pr_readback(readback_path)
+
+
+def test_phase3_rebind_cli_does_not_print_pass_before_readback(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+
+    def fail(point: str, index: int) -> None:
+        if (point, index) == ("readback-write", 0):
+            raise OSError("readback publication fault")
+
+    setattr(MIGRATION, "FAULT_HOOK", fail)
+    code = MIGRATION.main(
+        ["phase3-rebind", "--request", str(case["request_path"])]
+    )
+    captured = capsys.readouterr()
+
+    assert code == 3
+    assert "PASS" not in captured.out
+    assert "committed-awaiting-readback" in captured.err
+    assert json.loads(case["manifest_path"].read_text()) == case["replacement_manifest"]
 
 
 @pytest.mark.parametrize(
@@ -3796,9 +4186,79 @@ def test_committed_cleanup_failure_retains_recoverable_journal(tmp_path: Path):
         MIGRATION.apply_runtime_request(case["request_path"], case["operation"])
     assert MIGRATION._journal_path().exists()
     setattr(MIGRATION, "FAULT_HOOK", None)
-    MIGRATION.recover_incomplete_transaction()
+    assert (
+        MIGRATION.recover_incomplete_transaction()
+        == "committed-replacement-retained"
+    )
     assert json.loads(case["manifest_path"].read_text()) == case["replacement_manifest"]
     assert not MIGRATION._journal_path().exists()
+
+
+def test_one_shot_post_commit_cleanup_failure_recovers_as_committed_not_rollback(
+    tmp_path: Path,
+):
+    case = _runtime_case(tmp_path, "phase9-update")
+    failed = False
+
+    def fail_once(point: str, index: int) -> None:
+        nonlocal failed
+        if not failed and (point, index) == ("cleanup-unlink", 0):
+            failed = True
+            raise OSError("one-shot cleanup fault")
+
+    setattr(MIGRATION, "FAULT_HOOK", fail_once)
+    result = MIGRATION.apply_runtime_request(case["request_path"], case["operation"])
+
+    assert failed is True
+    assert result is None
+    assert json.loads(case["manifest_path"].read_text()) == case["replacement_manifest"]
+    assert not MIGRATION._journal_path().exists()
+
+
+def test_phase3_rebind_one_shot_committed_cleanup_recovery_closes_readback(
+    tmp_path: Path,
+):
+    case = _runtime_case(tmp_path, "phase3-rebind")
+    failed = False
+
+    def fail_once(point: str, index: int) -> None:
+        nonlocal failed
+        if not failed and (point, index) == ("cleanup-unlink", 0):
+            failed = True
+            raise OSError("one-shot cleanup fault")
+
+    setattr(MIGRATION, "FAULT_HOOK", fail_once)
+    readback_path = MIGRATION.apply_runtime_request(
+        case["request_path"], case["operation"]
+    )
+
+    assert failed is True
+    assert readback_path is not None and readback_path.is_file()
+    assert json.loads(case["manifest_path"].read_text()) == case["replacement_manifest"]
+    assert not MIGRATION._journal_path().exists()
+    MIGRATION.validate_pre_pr_readback(readback_path)
+
+
+def test_public_transaction_entry_points_have_no_lock_or_recovery_bypass(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    assert set(inspect.signature(MIGRATION.apply_plan).parameters) == {"plan_path"}
+    assert set(inspect.signature(MIGRATION.apply_runtime_request).parameters) == {
+        "request_path",
+        "operation",
+    }
+    assert not inspect.signature(MIGRATION.recover_incomplete_transaction).parameters
+
+    alternate = tmp_path / "caller-selected-state"
+    monkeypatch.setenv("WU_SESSION_MIGRATION_STATE_DIR", str(alternate))
+    setattr(MIGRATION, "_TEST_STATE_ROOT", None)
+    production_root = (
+        Path(MIGRATION.pwd.getpwuid(os.getuid()).pw_dir)
+        / ".local/state/ai/wu-session-migration"
+    )
+    assert MIGRATION._state_root() == production_root
+    assert MIGRATION._state_root() != alternate
+    assert "WU_SESSION_MIGRATION_STATE_DIR" not in inspect.getsource(MIGRATION._state_root)
 
 
 def test_recovery_subprocess_interruption_is_retried_without_target_mutation(tmp_path: Path):

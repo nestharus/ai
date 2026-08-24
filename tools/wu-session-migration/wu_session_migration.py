@@ -6,6 +6,7 @@ import fcntl
 import hashlib
 import json
 import os
+import pwd
 import re
 import stat
 import subprocess
@@ -230,9 +231,54 @@ PHASE3_REVISION_ENTRY_KEYS = {
     "return_to_phase_3_audit_ref",
     "return_to_phase_3_audit_sha256",
 }
+PHASE4_RESULT_PATH_FIELDS = {
+    "dispatch_manifest_path",
+    "join_manifest_path",
+    "aggregate_report_path",
+    "expected_process_path",
+    "process_tree_report_path",
+    "process_tree_path",
+    "audit_history_path",
+}
+PHASE4_RESULT_REQUIRED_KEYS = {
+    "schema",
+    "status",
+    "caller_mode",
+    "ticket_id",
+    "cycle_id",
+    "estimate_disposition",
+    *PHASE4_RESULT_PATH_FIELDS,
+    "result_path",
+    "blocking_rows",
+    "exception_rows",
+    "inventory_resolution_rows",
+    "skip_rows",
+    "stale_refusal_rows",
+    "currentness_key_summary",
+    "terminal_decision",
+    "next_action",
+    "repair_route",
+    "semantic_disposition",
+    "terminal_disposition",
+    "phase_5_authorized",
+    "repository_root",
+    "worktree_path",
+    "gate_results",
+    "process_proof",
+    "workflow_stop_reason",
+    "base_branch",
+    "base_ref",
+    "base_sha",
+    "head_branch",
+    "head_ref",
+    "head_sha",
+    "diff_sha256",
+    "artifact_sha256",
+}
 
 # Tests replace this hook to inject deterministic failures without weakening production checks.
 FAULT_HOOK: Callable[[str, int], None] | None = None
+_TEST_STATE_ROOT: Path | None = None
 
 
 class MigrationError(ValueError):
@@ -244,6 +290,10 @@ class InputError(MigrationError):
 
 
 class ApplyError(MigrationError):
+    pass
+
+
+class CommittedAwaitingReadbackError(ApplyError):
     pass
 
 
@@ -278,43 +328,47 @@ def _parser() -> argparse.ArgumentParser:
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(list(argv) if argv is not None else None)
     try:
-        with _cutover_lock():
-            recover_incomplete_transaction()
-            if args.command == "validate-pre-pr-readback":
-                validate_pre_pr_readback(args.readback)
-                print(f"WU-SESSION-PRE-PR-READBACK: PASS; evidence={args.readback}")
-                return 0
-            if args.command == "dry-run":
-                plan = build_plan(
-                    args.inventory,
-                    args.pr_evidence,
-                    args.dispositions,
-                    args.reviewed_inventory_sha256,
-                    args.conflict_resolutions,
-                    args.plan,
-                )
-                try:
-                    _atomic_write_bytes(args.plan, _json_bytes(plan))
-                except OSError as exc:
-                    raise InputError(f"cannot write plan {args.plan}: {exc}") from exc
-                print(
-                    "WU-SESSION-MIGRATION-DRY-RUN: "
-                    f"{'PASS' if plan['eligible'] else 'REFUSED'}; plan={args.plan}"
-                )
-                return 0 if plan["eligible"] else 1
-            if args.command == "capture-evidence":
+        if args.command == "validate-pre-pr-readback":
+            validate_pre_pr_readback(args.readback)
+            print(f"WU-SESSION-PRE-PR-READBACK: PASS; evidence={args.readback}")
+            return 0
+        if args.command in {"dry-run", "capture-evidence"}:
+            with _cutover_lock():
+                _recover_incomplete_transaction_locked()
+                if args.command == "dry-run":
+                    plan = build_plan(
+                        args.inventory,
+                        args.pr_evidence,
+                        args.dispositions,
+                        args.reviewed_inventory_sha256,
+                        args.conflict_resolutions,
+                        args.plan,
+                    )
+                    try:
+                        _atomic_write_bytes(args.plan, _json_bytes(plan))
+                    except OSError as exc:
+                        raise InputError(f"cannot write plan {args.plan}: {exc}") from exc
+                    print(
+                        "WU-SESSION-MIGRATION-DRY-RUN: "
+                        f"{'PASS' if plan['eligible'] else 'REFUSED'}; plan={args.plan}"
+                    )
+                    return 0 if plan["eligible"] else 1
                 capture_evidence(
                     args.inventory, args.reviewed_inventory_sha256, args.output
                 )
                 print(f"WU-SESSION-PR-EVIDENCE: PASS; evidence={args.output}")
                 return 0
-            if args.command == "apply":
-                apply_plan(args.plan, lock_already_held=True)
-                print(f"WU-SESSION-MIGRATION-APPLY: PASS; plan={args.plan}")
-                return 0
-            apply_runtime_request(args.request, args.command, lock_already_held=True)
-            print(f"WU-SESSION-RUNTIME-WRITE: PASS; operation={args.command}; request={args.request}")
+        if args.command == "apply":
+            apply_plan(args.plan)
+            print(f"WU-SESSION-MIGRATION-APPLY: PASS; plan={args.plan}")
             return 0
+        readback_path = apply_runtime_request(args.request, args.command)
+        readback_suffix = f"; readback={readback_path}" if readback_path is not None else ""
+        print(
+            "WU-SESSION-RUNTIME-WRITE: PASS; "
+            f"operation={args.command}; request={args.request}{readback_suffix}"
+        )
+        return 0
     except InputError as exc:
         print(f"wu-session-migration: {exc}", file=sys.stderr)
         return 2
@@ -501,13 +555,10 @@ def build_plan(
     return plan
 
 
-def apply_plan(plan_path: Path, *, lock_already_held: bool = False) -> None:
-    if not lock_already_held:
-        with _cutover_lock():
-            recover_incomplete_transaction()
-            _apply_plan_locked(plan_path)
-        return
-    _apply_plan_locked(plan_path)
+def apply_plan(plan_path: Path) -> None:
+    with _cutover_lock():
+        _recover_incomplete_transaction_locked()
+        _apply_plan_locked(plan_path)
 
 
 def _apply_plan_locked(plan_path: Path) -> None:
@@ -551,20 +602,27 @@ def _apply_plan_locked(plan_path: Path) -> None:
 def apply_runtime_request(
     request_path: Path,
     operation: str,
-    *,
-    lock_already_held: bool = False,
-) -> None:
+) -> Path | None:
     if operation not in RUNTIME_OPERATIONS:
         raise InputError(f"unsupported runtime operation: {operation}")
-    if not lock_already_held:
-        with _cutover_lock():
-            recover_incomplete_transaction()
-            _apply_runtime_request_locked(request_path, operation)
-        return
-    _apply_runtime_request_locked(request_path, operation)
+    with _cutover_lock():
+        _recover_incomplete_transaction_locked()
+        return _apply_runtime_request_locked(request_path, operation)
 
 
 def validate_pre_pr_readback(
+    readback_path: Path,
+    *,
+    expected_manifest: Mapping[str, Any] | None = None,
+) -> None:
+    with _cutover_lock():
+        _recover_incomplete_transaction_locked()
+        _validate_pre_pr_readback_locked(
+            readback_path, expected_manifest=expected_manifest
+        )
+
+
+def _validate_pre_pr_readback_locked(
     readback_path: Path,
     *,
     expected_manifest: Mapping[str, Any] | None = None,
@@ -679,9 +737,39 @@ def validate_pre_pr_readback(
         raise InputError("pre-PR readback verdict must equal PASS")
 
 
-def _apply_runtime_request_locked(request_path: Path, operation: str) -> None:
+def _apply_runtime_request_locked(request_path: Path, operation: str) -> Path | None:
     request_raw = _safe_read_bytes(request_path)
     request = _decode_json(request_raw, request_path)
+    source_manifest = None
+    if operation == "phase3-rebind":
+        manifest_path_value = request.get("manifest_path")
+        if isinstance(manifest_path_value, str):
+            manifest_path = Path(manifest_path_value)
+            source_manifest = _decode_json(
+                _safe_read_bytes(manifest_path), manifest_path
+            )
+        source_record = cast(Mapping[str, Any], request.get("sources", {})).get(
+            "manifest"
+        )
+        if (
+            source_manifest is not None
+            and source_manifest == request.get("replacement_manifest")
+            and isinstance(source_record, Mapping)
+            and source_record.get("sha256") != _sha256(_json_bytes(source_manifest))
+        ):
+            source_manifest = _reconstruct_phase3_rebind_source_manifest(
+                source_manifest
+            )
+            if (
+                source_record.get("sha256")
+                != _sha256(_json_bytes(source_manifest))
+            ):
+                raise ApplyError(
+                    "committed phase3-rebind request cannot reconstruct its source manifest"
+                )
+            return _publish_phase3_rebind_readback(
+                request_path, request, source_manifest
+            )
     writes, guards, planning_roots = _validate_runtime_request(
         request, operation, check_sources=True
     )
@@ -699,6 +787,95 @@ def _apply_runtime_request_locked(request_path: Path, operation: str) -> None:
         writes=writes,
         read_only_guards=guards,
     )
+    if operation != "phase3-rebind":
+        return None
+    assert source_manifest is not None
+    return _publish_phase3_rebind_readback(request_path, request, source_manifest)
+
+
+def _publish_phase3_rebind_readback(
+    request_path: Path,
+    request: Mapping[str, Any],
+    source_manifest: Mapping[str, Any],
+) -> Path:
+    manifest_path = Path(cast(str, request["manifest_path"]))
+    index_path = Path(cast(str, request["index_path"]))
+    scratch_dir = Path(cast(str, source_manifest["scratch_dir"]))
+    next_attempt = cast(int, request["replacement_manifest"]["phase_3_binding_attempt"])
+    readback_dir = scratch_dir / "session-writes"
+    readback_path = readback_dir / f"phase3-rebind-attempt-{next_attempt}.readback.json"
+    try:
+        readback_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+        _validate_runtime_directory(readback_dir, "Phase 3 readback directory")
+        if readback_path.exists() or readback_path.is_symlink():
+            _validate_pre_pr_readback_locked(readback_path)
+            return readback_path
+        index_document = _decode_json(_safe_read_bytes(index_path), index_path)
+        current_manifest = _decode_json(_safe_read_bytes(manifest_path), manifest_path)
+        artifact_records = cast(list[Mapping[str, Any]], request["sources"]["artifacts"])
+        readback = {
+            "schema": PRE_PR_READBACK_SCHEMA,
+            "operation": "phase3-rebind",
+            "request_path": str(request_path),
+            "request_sha256": _sha256(_safe_read_bytes(request_path)),
+            "source_manifest": dict(source_manifest),
+            "manifest_identity": runtime_source_identity(manifest_path),
+            "changed_keys": sorted(
+                key
+                for key in set(source_manifest) | set(current_manifest)
+                if source_manifest.get(key) != current_manifest.get(key)
+            ),
+            "artifact_identities": [
+                {**record, **runtime_source_identity(Path(record["path"]))}
+                for record in artifact_records
+            ],
+            "active_index_identity": runtime_source_identity(index_path),
+            "active_index_rows": index_document["sessions"],
+            "synthesized_row": False,
+            "journal_retained": False,
+            "verdict": "PASS",
+        }
+        _atomic_write_bytes(readback_path, _json_bytes(readback), "readback")
+        _validate_pre_pr_readback_locked(readback_path)
+    except (MigrationError, OSError) as exc:
+        raise CommittedAwaitingReadbackError(
+            "committed-awaiting-readback: Phase 3 replacement is committed but "
+            f"closed readback is not validated: {readback_path}: {exc}"
+        ) from exc
+    return readback_path
+
+
+def _reconstruct_phase3_rebind_source_manifest(
+    replacement_manifest: Mapping[str, Any],
+) -> dict[str, Any]:
+    attempt = replacement_manifest.get("phase_3_binding_attempt")
+    lineage = replacement_manifest.get("phase_3_revision_history")
+    history = replacement_manifest.get("phase_history")
+    if (
+        isinstance(attempt, bool)
+        or not isinstance(attempt, int)
+        or attempt not in {2, 3}
+        or not isinstance(lineage, list)
+        or len(lineage) != attempt - 1
+        or not isinstance(history, list)
+        or not history
+        or not isinstance(lineage[-1], Mapping)
+    ):
+        raise ApplyError("committed phase3-rebind replacement is not reconstructable")
+    appended = lineage[-1]
+    source = copy.deepcopy(dict(replacement_manifest))
+    source["phase_3_estimate_writeback_ref"] = appended.get("estimate_writeback_ref")
+    source["phase_3_estimate_writeback_sha256"] = appended.get(
+        "estimate_writeback_sha256"
+    )
+    source["phase_history"] = history[:-1]
+    if attempt == 2:
+        source.pop("phase_3_binding_attempt", None)
+        source.pop("phase_3_revision_history", None)
+    else:
+        source["phase_3_binding_attempt"] = attempt - 1
+        source["phase_3_revision_history"] = lineage[:-1]
+    return source
 
 
 def _execute_transaction(
@@ -711,7 +888,7 @@ def _execute_transaction(
     planning_roots: list[Path],
     writes: Sequence[Mapping[str, Any]],
     read_only_guards: Sequence[Mapping[str, Any]] = (),
-) -> None:
+) -> str:
     transaction_id = str(uuid.uuid4())
     targets: list[dict[str, Any]] = []
     held_parents: dict[Path, dict[str, Any]] = {}
@@ -871,16 +1048,19 @@ def _execute_transaction(
         _inject_fault("journal-transition", len(targets) + 1)
         _write_journal(journal)
         _cleanup_transaction(journal, held_parents=held_parents)
+        return "committed"
     except BaseException as exc:
         if isinstance(exc, (KeyboardInterrupt, SystemExit)):
             raise
         if _journal_path().exists():
             try:
-                recover_incomplete_transaction()
+                recovery_disposition = _recover_incomplete_transaction_locked()
             except ApplyError as recovery_exc:
                 raise ApplyError(
                     f"transaction failed; recovery remains pending: {exc}; {recovery_exc}"
                 ) from exc
+            if recovery_disposition == "committed-replacement-retained":
+                return recovery_disposition
         if isinstance(exc, InputError):
             raise
         raise ApplyError(f"transaction failed and was rolled back: {exc}") from exc
@@ -889,10 +1069,15 @@ def _execute_transaction(
             os.close(parent["fd"])
 
 
-def recover_incomplete_transaction() -> None:
+def recover_incomplete_transaction() -> str:
+    with _cutover_lock():
+        return _recover_incomplete_transaction_locked()
+
+
+def _recover_incomplete_transaction_locked() -> str:
     journal_path = _journal_path()
     if not journal_path.exists():
-        return
+        return "no-transaction"
     try:
         journal = _decode_json(_safe_read_bytes(journal_path), journal_path)
     except MigrationError as exc:
@@ -976,6 +1161,11 @@ def recover_incomplete_transaction() -> None:
         if failures:
             raise ApplyError("recovery failures: " + "; ".join(failures))
         _remove_transaction_journal()
+        return (
+            "committed-replacement-retained"
+            if journal["phase"] == "committed"
+            else "preimage-restored"
+        )
     finally:
         for parent in held_parents.values():
             os.close(parent["fd"])
@@ -3059,6 +3249,7 @@ def _validate_phase3_rebind(
         records,
         cast(Mapping[str, Any], prior_estimate),
         cast(Mapping[str, Any], revised_estimate),
+        cast(Mapping[str, Any], return_decision),
         source_lineage,
     )
     _validate_phase3_prior_binding(
@@ -3076,6 +3267,7 @@ def _validate_phase3_rebind(
         records,
         source_lineage,
         manifest_path,
+        current_attempt,
     )
     _validate_phase3_revised_estimate(
         source_manifest,
@@ -3088,7 +3280,7 @@ def _validate_phase3_rebind(
         current_attempt + 1,
     )
     _validate_phase3_rebind_history_transition(
-        source_manifest, replacement_manifest, manifest_path
+        source_manifest, replacement_manifest, manifest_path, records
     )
     estimate_record = records["phase-3-estimate-writeback"]
     if (
@@ -3104,6 +3296,7 @@ def _validate_phase3_rebind_roles(
     records: Mapping[str, Mapping[str, Any]],
     prior_estimate: Mapping[str, Any],
     revised_estimate: Mapping[str, Any],
+    return_decision: Mapping[str, Any],
     lineage: Sequence[Mapping[str, Any]],
 ) -> None:
     required = {
@@ -3111,7 +3304,14 @@ def _validate_phase3_rebind_roles(
         "phase-3-estimate-writeback",
         "phase-3-proposal",
         "phase-4-return-audit",
+        "phase-4-canonical-audit",
         "phase-4-return-decision",
+        "phase-4-dispatch-manifest",
+        "phase-4-join-manifest",
+        "phase-4-aggregate-report",
+        "phase-4-expected-process",
+        "phase-4-process-tree-report",
+        "phase-4-process-tree",
         "prior-phase-3-estimate-writeback",
         "prior-phase-3-proposal",
         "resolved-ticket-contract",
@@ -3119,10 +3319,6 @@ def _validate_phase3_rebind_roles(
     }
     if revised_estimate.get("cold_start_disposition_ref") is not None:
         required.add("cold-start-disposition")
-    if revised_estimate.get("disposition") == "write_verified":
-        required.add("write-verification-evidence")
-    if prior_estimate.get("disposition") == "write_verified":
-        required.add("prior-write-verification-evidence")
     for entry in lineage:
         attempt = entry["attempt"]
         required.update(
@@ -3134,7 +3330,33 @@ def _validate_phase3_rebind_roles(
             }
         )
     actual = set(records)
-    if actual not in (required, required | {"phase-0-reresolve-readback"}):
+    artifact_hashes = return_decision.get("artifact_sha256")
+    process_report_path = return_decision.get("process_tree_report_path")
+    if (
+        isinstance(artifact_hashes, Mapping)
+        and (
+            (
+                isinstance(process_report_path, str)
+                and artifact_hashes.get(process_report_path) is None
+            )
+            or (
+                "phase-4-process-tree-report" not in actual
+                and any(digest is None for digest in artifact_hashes.values())
+            )
+        )
+    ):
+        required.remove("phase-4-process-tree-report")
+    allowed_dynamic = {
+        role
+        for role, record in records.items()
+        if role.startswith("phase-4-authority-artifact-")
+        and isinstance(artifact_hashes, Mapping)
+        and artifact_hashes.get(record.get("path")) == record.get("sha256")
+    }
+    if actual - allowed_dynamic not in (
+        required,
+        required | {"phase-0-reresolve-readback"},
+    ):
         raise InputError(
             "phase3-rebind artifact roles are partial, mixed, or unknown: "
             f"missing={sorted(required - actual)} unknown={sorted(actual - required)}"
@@ -3169,6 +3391,8 @@ def _validate_phase3_prior_binding(
         or (current_attempt == 1 and estimate.get("phase_3_binding_attempt", 1) != 1)
     ):
         raise InputError("phase3-rebind prior estimate identity is malformed")
+    if estimate.get("disposition") != "no_write_policy_disabled":
+        raise InputError("phase3-rebind prior estimate must use no_write_policy_disabled")
     proposal_record = records["prior-phase-3-proposal"]
     if (
         estimate.get("phase_3_proposal_path") != proposal_record.get("path")
@@ -3234,27 +3458,65 @@ def _validate_phase4_return_decision(
     records: Mapping[str, Mapping[str, Any]],
     lineage: Sequence[Mapping[str, Any]],
     manifest_path: Path,
+    current_attempt: int,
 ) -> None:
     decision_record = records["phase-4-return-decision"]
-    audit_record = records["phase-4-return-audit"]
+    audit_snapshot_record = records["phase-4-return-audit"]
+    canonical_audit_record = records["phase-4-canonical-audit"]
     artifact_hashes = decision.get("artifact_sha256")
     estimate_identity = decision.get("estimate_disposition")
-    proposal_identity = decision.get("phase_3_proposal")
     proposal_path = cast(str, prior_estimate.get("phase_3_proposal_path"))
     proposal_sha256 = prior_estimate.get("phase_3_proposal_sha256")
-    direct_proposal_match = isinstance(proposal_identity, Mapping) and (
-        proposal_identity.get("path"), proposal_identity.get("sha256")
-    ) == (proposal_path, proposal_sha256)
     mapped_proposal_match = isinstance(artifact_hashes, Mapping) and (
         artifact_hashes.get(proposal_path) == proposal_sha256
     )
+    cycle_id = f"{str(manifest.get('ticket_id')).lower()}-phase-4-attempt-{current_attempt}"
+    currentness = decision.get("currentness_key_summary")
+    repair_route = decision.get("repair_route")
+    required_lists = (
+        "blocking_rows",
+        "exception_rows",
+        "inventory_resolution_rows",
+        "skip_rows",
+        "stale_refusal_rows",
+    )
     if (
-        decision.get("ticket_id") != manifest.get("ticket_id")
+        not PHASE4_RESULT_REQUIRED_KEYS <= set(decision)
+        or decision.get("schema") != "apply-gate-set-result-v1"
+        or decision.get("caller_mode") != "implementation-phase-4"
+        or decision.get("ticket_id") != manifest.get("ticket_id")
+        or decision.get("cycle_id") != cycle_id
         or decision.get("status") != "BLOCKED"
+        or decision.get("semantic_disposition") not in {"MEDIUM", "HIGH"}
         or decision.get("terminal_decision")
         != "return_to_phase_3_proposal_revision"
         or decision.get("phase_5_authorized") is not False
+        or not isinstance(decision.get("terminal_disposition"), str)
+        or not decision["terminal_disposition"].strip()
+        or decision.get("repository_root") != manifest.get("repo_root")
+        or decision.get("worktree_path") != manifest.get("worktree_path")
+        or not isinstance(decision.get("workflow_stop_reason"), str)
+        or not decision["workflow_stop_reason"].strip()
+        or not isinstance(decision.get("next_action"), str)
+        or not decision["next_action"].strip()
+        or not isinstance(repair_route, Mapping)
+        or repair_route.get("destination")
+        != "implementation_phase_3_proposal_revision"
+        or not isinstance(currentness, Mapping)
+        or currentness.get("cycle_id") != cycle_id
+        or currentness.get("caller_mode") != "implementation-phase-4"
+        or currentness.get("base_ref_matches") is not True
+        or currentness.get("base_sha_matches") is not True
+        or currentness.get("head_ref_matches") is not True
+        or currentness.get("head_sha_matches") is not True
+        or currentness.get("proposal_hash_matches") is not True
+        or currentness.get("currentness_disposition") != "current_non_accepting"
+        or any(not isinstance(decision.get(key), list) for key in required_lists)
+        or not decision.get("blocking_rows")
         or not isinstance(estimate_identity, Mapping)
+        or estimate_identity.get("disposition") != "no_write_policy_disabled"
+        or estimate_identity.get("estimate_mutation_enabled") is not False
+        or estimate_identity.get("update_estimate_dispatch_executed") is not False
         or (
             estimate_identity.get("path"),
             estimate_identity.get("sha256"),
@@ -3263,18 +3525,89 @@ def _validate_phase4_return_decision(
             manifest.get("phase_3_estimate_writeback_ref"),
             manifest.get("phase_3_estimate_writeback_sha256"),
         )
-        or not (direct_proposal_match or mapped_proposal_match)
+        or not isinstance(artifact_hashes, Mapping)
+        or artifact_hashes.get(manifest.get("phase_3_estimate_writeback_ref"))
+        != manifest.get("phase_3_estimate_writeback_sha256")
+        or not mapped_proposal_match
     ):
         raise InputError("phase3-rebind lacks an exact retained return-to-Phase-3 decision")
     if (
-        decision.get("audit_history_path") != audit_record.get("path")
+        decision.get("base_branch") != manifest.get("base_branch")
+        or decision.get("head_branch") != manifest.get("branch")
+        or decision.get("head_sha") != manifest.get("branch_out_sha")
+        or not all(
+            isinstance(decision.get(key), str) and decision[key]
+            for key in ("base_ref", "head_ref")
+        )
+    ):
+        raise InputError("phase3-rebind Phase 4 implementation identity is wrong")
+    for key in ("base_sha", "head_sha"):
+        _require_full_oid(decision.get(key), f"phase3-rebind Phase 4 {key}")
+    _require_sha256(decision.get("diff_sha256"), "phase3-rebind Phase 4 diff")
+    if (
+        decision.get("result_path") != decision_record.get("path")
+        or decision.get("audit_history_path") != canonical_audit_record.get("path")
+        or canonical_audit_record.get("path")
+        != str(manifest_path.parent / "audit-history.md")
+        or audit_snapshot_record.get("path")
+        != str(_phase4_audit_snapshot_path(manifest_path, current_attempt))
+        or audit_snapshot_record.get("sha256") != canonical_audit_record.get("sha256")
         or not isinstance(artifact_hashes, Mapping)
-        or artifact_hashes.get(audit_record.get("path")) != audit_record.get("sha256")
+        or artifact_hashes.get(canonical_audit_record.get("path"))
+        != canonical_audit_record.get("sha256")
     ):
         raise InputError("phase3-rebind return decision does not bind its retained audit")
+    records_by_path = {record["path"]: record for record in records.values()}
+    for field in PHASE4_RESULT_PATH_FIELDS:
+        path_value = decision.get(field)
+        digest = artifact_hashes.get(path_value) if isinstance(path_value, str) else None
+        if (
+            not isinstance(path_value, str)
+            or path_value not in artifact_hashes
+            or not Path(path_value).is_absolute()
+            or path_value != os.path.normpath(path_value)
+            or not _is_below(Path(path_value), manifest_path.parent)
+            or (
+                digest is None
+                and (field != "process_tree_report_path" or Path(path_value).exists())
+            )
+            or (
+                digest is not None
+                and (
+                    path_value not in records_by_path
+                    or digest != records_by_path[path_value].get("sha256")
+                )
+            )
+        ):
+            raise InputError(f"phase3-rebind Phase 4 output is unguarded or stale: {field}")
+    if any(
+        not isinstance(path, str)
+        or not Path(path).is_absolute()
+        or not _is_below(Path(path), manifest_path.parent)
+        or (
+            digest is None
+            and Path(path).exists()
+        )
+        or (
+            digest is not None
+            and (
+                not isinstance(digest, str)
+                or path not in records_by_path
+                or records_by_path[path].get("sha256") != digest
+            )
+        )
+        for path, digest in artifact_hashes.items()
+    ):
+        raise InputError("phase3-rebind Phase 4 authority artifact map is incomplete or stale")
+    _validate_phase4_producer_evidence(
+        decision,
+        cast(Mapping[str, Any], artifact_hashes),
+        records_by_path,
+        manifest_path,
+    )
     if not all(
         _is_below(Path(cast(str, record["path"])), manifest_path.parent)
-        for record in (decision_record, audit_record)
+        for record in (decision_record, audit_snapshot_record, canonical_audit_record)
     ):
         raise InputError("phase3-rebind return evidence escapes the session planning directory")
     retained_paths = {
@@ -3289,11 +3622,103 @@ def _validate_phase4_return_decision(
     }
     if (
         decision_record["path"] in retained_paths
-        or audit_record["path"] in retained_paths
+        or audit_snapshot_record["path"] in retained_paths
         or decision_record["sha256"] in retained_hashes
-        or audit_record["sha256"] in retained_hashes
+        or audit_snapshot_record["sha256"] in retained_hashes
     ):
         raise InputError("phase3-rebind repeats retained return evidence")
+
+
+def _validate_phase4_producer_evidence(
+    decision: Mapping[str, Any],
+    artifact_hashes: Mapping[str, Any],
+    records_by_path: Mapping[str, Mapping[str, Any]],
+    manifest_path: Path,
+) -> None:
+    gate_results = decision.get("gate_results")
+    if not isinstance(gate_results, list) or not gate_results:
+        raise InputError("phase3-rebind Phase 4 gate results are incomplete")
+    gate_ids: set[str] = set()
+    blocking_gate = False
+    for result in gate_results:
+        if not isinstance(result, Mapping):
+            raise InputError("phase3-rebind Phase 4 gate result is malformed")
+        gate_id = result.get("id")
+        path = result.get("path")
+        digest = result.get("sha256")
+        if (
+            not isinstance(gate_id, str)
+            or not gate_id
+            or gate_id in gate_ids
+            or not isinstance(path, str)
+            or not Path(path).is_absolute()
+            or path != os.path.normpath(path)
+            or not _is_below(Path(path), manifest_path.parent)
+            or not isinstance(result.get("blocking"), bool)
+            or (
+                digest is None
+                and (Path(path).exists() or artifact_hashes.get(path) is not None)
+            )
+            or (
+                digest is not None
+                and (
+                    artifact_hashes.get(path) != digest
+                    or path not in records_by_path
+                    or records_by_path[path].get("sha256") != digest
+                )
+            )
+        ):
+            raise InputError("phase3-rebind Phase 4 gate result is malformed or stale")
+        gate_ids.add(gate_id)
+        blocking_gate = blocking_gate or result["blocking"]
+        nested_results = result.get("nested_results", [])
+        if not isinstance(nested_results, list) or any(
+            not isinstance(nested, Mapping)
+            or not isinstance(nested.get("sha256"), str)
+            or nested.get("sha256") not in artifact_hashes.values()
+            for nested in nested_results
+        ):
+            raise InputError("phase3-rebind Phase 4 nested gate result is unguarded")
+    if not blocking_gate:
+        raise InputError("phase3-rebind Phase 4 result has no blocking gate")
+
+    process_proof = decision.get("process_proof")
+    if (
+        not isinstance(process_proof, Mapping)
+        or not isinstance(process_proof.get("status"), str)
+        or not process_proof["status"]
+        or process_proof.get("mode") != "blocking"
+    ):
+        raise InputError("phase3-rebind Phase 4 process proof is malformed")
+    for field in (
+        "expected_process_path",
+        "process_tree_report_path",
+        "process_tree_path",
+    ):
+        digest_field = field.removesuffix("_path") + "_sha256"
+        path = decision[field]
+        if (
+            process_proof.get(field) != path
+            or process_proof.get(digest_field) != artifact_hashes.get(path)
+        ):
+            raise InputError("phase3-rebind Phase 4 process proof is stale")
+    if process_proof["status"] == "PASS" and (
+        process_proof.get("auditor_verdict") != "PASS"
+        or process_proof.get("process_tree_report_sha256") is None
+    ):
+        raise InputError("phase3-rebind Phase 4 PASS process proof is invalid")
+    for prefix in ("failure_evidence", "validation"):
+        path = process_proof.get(f"{prefix}_path")
+        digest = process_proof.get(f"{prefix}_sha256")
+        if path is None and digest is None:
+            continue
+        if (
+            not isinstance(path, str)
+            or artifact_hashes.get(path) != digest
+            or path not in records_by_path
+            or records_by_path[path].get("sha256") != digest
+        ):
+            raise InputError("phase3-rebind Phase 4 process evidence is unguarded")
 
 
 def _validate_phase3_revised_estimate(
@@ -3311,6 +3736,11 @@ def _validate_phase3_revised_estimate(
     prior_record = records["prior-phase-3-estimate-writeback"]
     return_record = records["phase-4-return-decision"]
     audit_record = records["phase-4-return-audit"]
+    if (
+        manifest.get("estimate_writeback_disposition") != "no_write_policy_disabled"
+        or revised_estimate.get("disposition") != "no_write_policy_disabled"
+    ):
+        raise InputError("phase3-rebind requires no_write_policy_disabled")
     if estimate_record.get("path") != str(
         _phase3_estimate_path(manifest_path, cast(str, manifest["ticket_id"]), next_attempt)
     ):
@@ -3352,12 +3782,6 @@ def _validate_phase3_revised_estimate(
         )
     ):
         raise InputError("phase3-rebind revised estimate lineage is malformed")
-    expected_disposition = {
-        "update_estimate_required": "write_verified",
-        "no_write_policy_disabled": "no_write_policy_disabled",
-    }.get(manifest.get("estimate_writeback_disposition"))
-    if expected_disposition is not None and revised_estimate.get("disposition") != expected_disposition:
-        raise InputError("phase3-rebind disposition does not match the current policy")
     if (
         revised_estimate.get("estimate_mutation_policy")
         != manifest.get("estimate_mutation_policy")
@@ -3406,6 +3830,7 @@ def _validate_phase3_rebind_history_transition(
     source_manifest: Mapping[str, Any],
     replacement_manifest: Mapping[str, Any],
     manifest_path: Path,
+    records: Mapping[str, Mapping[str, Any]] | None = None,
 ) -> None:
     current_attempt, source_lineage = _validate_phase3_revision_state(
         source_manifest, manifest_path
@@ -3429,13 +3854,23 @@ def _validate_phase3_rebind_history_transition(
     if replacement_lineage[:-1] != source_lineage:
         raise InputError("phase3-rebind must preserve the complete revision lineage prefix")
     appended = replacement_lineage[-1]
-    if (
-        appended["attempt"] != current_attempt
-        or appended["estimate_writeback_ref"]
-        != source_manifest["phase_3_estimate_writeback_ref"]
-        or appended["estimate_writeback_sha256"]
-        != source_manifest["phase_3_estimate_writeback_sha256"]
-    ):
+    expected = {
+        "attempt": current_attempt,
+        "estimate_writeback_ref": source_manifest["phase_3_estimate_writeback_ref"],
+        "estimate_writeback_sha256": source_manifest["phase_3_estimate_writeback_sha256"],
+    }
+    if records is not None:
+        expected.update(
+            {
+                "phase_3_proposal_path": records["prior-phase-3-proposal"]["path"],
+                "phase_3_proposal_sha256": records["prior-phase-3-proposal"]["sha256"],
+                "return_to_phase_3_ref": records["phase-4-return-decision"]["path"],
+                "return_to_phase_3_sha256": records["phase-4-return-decision"]["sha256"],
+                "return_to_phase_3_audit_ref": records["phase-4-return-audit"]["path"],
+                "return_to_phase_3_audit_sha256": records["phase-4-return-audit"]["sha256"],
+            }
+        )
+    if any(appended.get(key) != value for key, value in expected.items()):
         raise InputError("phase3-rebind appended lineage does not preserve the prior binding")
 
 
@@ -3574,6 +4009,14 @@ def _phase3_proposal_path(manifest_path: Path, ticket_id: str, attempt: int) -> 
         manifest_path.parent
         / "proposals"
         / f"{ticket_id.lower()}-{ticket_id}-attempt-{attempt}.md"
+    )
+
+
+def _phase4_audit_snapshot_path(manifest_path: Path, attempt: int) -> Path:
+    return (
+        manifest_path.parent
+        / "risk"
+        / f"phase-4-attempt-{attempt}-audit-history.snapshot.md"
     )
 
 
@@ -3764,7 +4207,7 @@ def _validate_phase3_producer_git_identities(
     readback = _decode_json(_safe_read_bytes(readback_path), readback_path)
     if readback.get("operation") != "phase0-reresolve":
         raise InputError("phase3-bind producer readback operation mismatch")
-    validate_pre_pr_readback(readback_path, expected_manifest=manifest)
+    _validate_pre_pr_readback_locked(readback_path, expected_manifest=manifest)
 
 
 def _verify_historical_git_blob(
@@ -4691,8 +5134,12 @@ def _atomic_write_bytes(path: Path, payload: bytes, fault_prefix: str | None = N
 
 
 def _state_root() -> Path:
-    override = os.environ.get("WU_SESSION_MIGRATION_STATE_DIR")
-    return Path(override) if override else Path.home() / ".local/state/ai/wu-session-migration"
+    if _TEST_STATE_ROOT is not None:
+        return _TEST_STATE_ROOT
+    return (
+        Path(pwd.getpwuid(os.getuid()).pw_dir)
+        / ".local/state/ai/wu-session-migration"
+    )
 
 
 def _journal_path() -> Path:
