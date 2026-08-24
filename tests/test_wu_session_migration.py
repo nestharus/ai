@@ -9,6 +9,7 @@ import copy
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -4299,10 +4300,23 @@ def test_phase3_rebind_one_shot_committed_cleanup_recovery_closes_readback(
     MIGRATION.validate_pre_pr_readback(readback_path)
 
 
-def test_supported_production_entry_points_bind_one_canonical_state(
+def test_supported_imported_entry_points_execute_under_disposable_passwd_home(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ):
     public = PRODUCTION_MIGRATION
+    passwd_home = tmp_path / "passwd-home"
+    production_root = passwd_home / ".local/state/ai/wu-session-migration"
+    lock_path = production_root / "cutover.lock"
+    journal_path = production_root / "transaction.json"
+    alternate = tmp_path / "caller-selected-state"
+
+    monkeypatch.setattr(
+        public.pwd,
+        "getpwuid",
+        lambda _uid: SimpleNamespace(pw_dir=str(passwd_home)),
+    )
+    monkeypatch.setenv("WU_SESSION_MIGRATION_STATE_DIR", str(alternate))
+
     assert set(inspect.signature(public.main).parameters) == {"argv"}
     assert set(inspect.signature(public.apply_plan).parameters) == {"plan_path"}
     assert set(inspect.signature(public.apply_runtime_request).parameters) == {
@@ -4315,78 +4329,172 @@ def test_supported_production_entry_points_bind_one_canonical_state(
     }
     assert not inspect.signature(public.recover_incomplete_transaction).parameters
 
-    alternate = tmp_path / "caller-selected-state"
-    monkeypatch.setenv("WU_SESSION_MIGRATION_STATE_DIR", str(alternate))
-    production_root = (
-        Path(public.pwd.getpwuid(os.getuid()).pw_dir)
-        / ".local/state/ai/wu-session-migration"
-    )
     assert not hasattr(public, "_TEST_STATE_ROOT")
     setattr(public, "_TEST_STATE_ROOT", alternate)
     try:
-        states = [public._production_state() for _ in range(5)]
-        assert {state.root for state in states} == {production_root}
-        assert {state.lock_path for state in states} == {
-            production_root / "cutover.lock"
-        }
-        assert {state.journal_path for state in states} == {
-            production_root / "transaction.json"
-        }
-        assert all(state.root != alternate for state in states)
-        with pytest.raises(AttributeError, match="immutable"):
-            states[0].root = alternate
+        malformed_plan = tmp_path / "malformed-plan.json"
+        malformed_request = tmp_path / "malformed-request.json"
+        malformed_readback = tmp_path / "malformed-readback.json"
+        for path in (malformed_plan, malformed_request, malformed_readback):
+            path.write_text("{", encoding="utf-8")
+
+        lock_path.unlink(missing_ok=True)
+        with pytest.raises(public.InputError):
+            public.apply_plan(malformed_plan)
+        assert lock_path.is_file()
+
+        lock_path.unlink()
+        with pytest.raises(public.InputError):
+            public.apply_runtime_request(malformed_request, "phase0-init")
+        assert lock_path.is_file()
+
+        lock_path.unlink()
+        with pytest.raises(public.InputError):
+            public.validate_pre_pr_readback(malformed_readback)
+        assert lock_path.is_file()
+
+        lock_path.unlink()
+        public.recover_incomplete_transaction()
+        assert lock_path.is_file()
+
+        case = _runtime_case(tmp_path / "interrupted-runtime", "phase0-init")
+        targets = [case["manifest_path"], case["index_path"]]
+
+        def interrupt_and_retain_recovery(point: str, index: int) -> None:
+            if (point, index) in {
+                ("commit-parent-fsync", 0),
+                ("rollback-unlink", 0),
+            }:
+                raise OSError(f"deterministic interruption {point}:{index}")
+
+        lock_path.unlink()
+        setattr(public, "FAULT_HOOK", interrupt_and_retain_recovery)
+        with pytest.raises(public.ApplyError, match="recovery remains pending"):
+            public.apply_runtime_request(case["request_path"], case["operation"])
+        setattr(public, "FAULT_HOOK", None)
+
+        assert lock_path.is_file()
+        assert journal_path.is_file()
+        journal = json.loads(journal_path.read_text())
+        assert journal["operation"] == case["operation"]
+        assert journal["plan_path"] == str(case["request_path"])
+
+        public.recover_incomplete_transaction()
+
+        assert not journal_path.exists()
+        assert all(not path.exists() for path in targets)
+        assert not _transaction_artifacts(targets)
+        assert not alternate.exists()
     finally:
+        setattr(public, "FAULT_HOOK", None)
         delattr(public, "_TEST_STATE_ROOT")
 
-    entry_points = (
-        public.main,
-        public.apply_plan,
-        public.apply_runtime_request,
-        public.validate_pre_pr_readback,
-        public.recover_incomplete_transaction,
-    )
-    assert all("_production_state()" in inspect.getsource(entry) for entry in entry_points)
-    state_source = inspect.getsource(public._state_root)
-    assert "_TEST_STATE_ROOT" not in state_source
-    assert "WU_SESSION_MIGRATION_STATE_DIR" not in state_source
 
-    help_result = subprocess.run(
-        [sys.executable, str(REAL_TOOL_DIR), "--help"],
+def test_shipped_cli_executes_public_branches_under_disposable_passwd_home(
+    tmp_path: Path,
+):
+    passwd_home = tmp_path / "passwd-home"
+    production_root = passwd_home / ".local/state/ai/wu-session-migration"
+    lock_path = production_root / "cutover.lock"
+    journal_path = production_root / "transaction.json"
+    alternate = tmp_path / "caller-selected-state"
+    bootstrap = tmp_path / "subprocess-bootstrap"
+    bootstrap.mkdir()
+    (bootstrap / "sitecustomize.py").write_text(
+        "import pathlib\n"
+        "import pwd\n"
+        "import types\n"
+        f"passwd_home = {str(passwd_home)!r}\n"
+        "pwd.getpwuid = lambda _uid: types.SimpleNamespace(pw_dir=passwd_home)\n"
+        "import wu_session_migration\n"
+        f"wu_session_migration._TEST_STATE_ROOT = pathlib.Path({str(alternate)!r})\n",
+        encoding="utf-8",
+    )
+    pythonpath = [str(bootstrap), str(REAL_TOOL_DIR)]
+    if os.environ.get("PYTHONPATH"):
+        pythonpath.append(os.environ["PYTHONPATH"])
+    env = {
+        **os.environ,
+        "PYTHONPATH": os.pathsep.join(pythonpath),
+        "WU_SESSION_MIGRATION_STATE_DIR": str(alternate),
+    }
+
+    runtime_case = _runtime_case(tmp_path / "interrupted-runtime", "phase0-init")
+    runtime_command = [
+        sys.executable,
+        str(REAL_TOOL_DIR),
+        runtime_case["operation"],
+        "--request",
+        str(runtime_case["request_path"]),
+    ]
+    interrupted_env = {**env, "WU_SESSION_MIGRATION_INTERRUPT": "commit-parent-fsync:0"}
+    interrupted = subprocess.run(
+        runtime_command,
+        env=interrupted_env,
         text=True,
         capture_output=True,
         check=False,
     )
-    assert help_result.returncode == 0
-    assert "state-root" not in help_result.stdout
-    assert "state-dir" not in help_result.stdout
+    assert interrupted.returncode == 97
+    assert lock_path.is_file()
+    assert journal_path.is_file()
+    interrupted_journal = json.loads(journal_path.read_text())
+    assert interrupted_journal["operation"] == runtime_case["operation"]
+    assert interrupted_journal["plan_path"] == str(runtime_case["request_path"])
 
-    fresh_probe = subprocess.run(
+    apply_fixture = _complete_fixture(tmp_path / "migration-apply")
+    apply_document = _plan(apply_fixture)
+    apply_plan_path = _write_plan(apply_fixture, apply_document)
+    applied = subprocess.run(
+        [sys.executable, str(REAL_TOOL_DIR), "apply", "--plan", str(apply_plan_path)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert applied.returncode == 0, applied.stderr
+    assert not journal_path.exists()
+    assert not runtime_case["manifest_path"].exists()
+    assert not runtime_case["index_path"].exists()
+    assert all(Path(path).is_file() for path in apply_document["active_index_paths"])
+
+    readback_case = _runtime_case(tmp_path / "pre-pr-readback", "phase3-bind")
+    source_manifest = json.loads(readback_case["manifest_path"].read_text())
+    runtime_result = subprocess.run(
         [
             sys.executable,
-            "-c",
-            (
-                "import importlib.util, pathlib\n"
-                f"source = pathlib.Path({str(REAL_TOOL_DIR / 'wu_session_migration.py')!r})\n"
-                "spec = importlib.util.spec_from_file_location('fresh_migration', source)\n"
-                "module = importlib.util.module_from_spec(spec)\n"
-                "spec.loader.exec_module(module)\n"
-                "state = module._production_state()\n"
-                "print(state.root)\n"
-                "print(state.lock_path)\n"
-                "print(state.journal_path)\n"
-            ),
+            str(REAL_TOOL_DIR),
+            readback_case["operation"],
+            "--request",
+            str(readback_case["request_path"]),
         ],
-        env={**os.environ, "WU_SESSION_MIGRATION_STATE_DIR": str(alternate)},
+        env=env,
         text=True,
         capture_output=True,
         check=False,
     )
-    assert fresh_probe.returncode == 0, fresh_probe.stderr
-    assert fresh_probe.stdout.splitlines() == [
-        str(production_root),
-        str(production_root / "cutover.lock"),
-        str(production_root / "transaction.json"),
-    ]
+    assert runtime_result.returncode == 0, runtime_result.stderr
+
+    readback_path = tmp_path / "phase3-bind.readback.json"
+    _write_json(readback_path, _pre_pr_readback(readback_case, source_manifest))
+    readback_result = subprocess.run(
+        [
+            sys.executable,
+            str(REAL_TOOL_DIR),
+            "validate-pre-pr-readback",
+            "--readback",
+            str(readback_path),
+        ],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert readback_result.returncode == 0, readback_result.stderr
+    assert "WU-SESSION-PRE-PR-READBACK: PASS" in readback_result.stdout
+    assert lock_path.is_file()
+    assert not journal_path.exists()
+    assert not alternate.exists()
 
 
 def test_internal_state_path_uses_transaction_mechanics_without_public_reachability(
