@@ -183,6 +183,152 @@ def test_resolve_label_ids_preserves_team_precedence_and_ambiguity(
     assert error.value.code == "AMBIGUOUS_LABEL"
 
 
+def test_apply_labels_cli_preserves_existing_issue_label(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record_property: Any,
+) -> None:
+    client = _client(monkeypatch)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    responses = iter(
+        [
+            {"data": {"issue": {
+                "team": {"id": "team-1", "key": "ACR"},
+                "labels": {"nodes": [{"id": "existing-label"}]},
+            }}},
+            _page([_label("hardening", "requested-label")], has_next=False, cursor=None),
+            {"data": {"issueUpdate": {
+                "success": True, "issue": {"id": "issue-1", "identifier": "ACR-1"},
+            }}},
+        ]
+    )
+
+    def run(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((query, variables))
+        return next(responses)
+
+    monkeypatch.setattr(client, "_run_graphql", run)
+    monkeypatch.setattr(linear_cli, "LinearClient", lambda: client)
+
+    linear_cli.main(["apply-labels", "ACR-1", "--team", "ACR", "--labels", "hardening"])
+
+    payload = json.loads(capsys.readouterr().out)
+    record_property("graphql_calls", json.dumps(calls))
+    record_property("cli_response", json.dumps(payload))
+    assert payload["ok"] is True
+    assert payload["data"]["id"] == "issue-1"
+    assert len(calls) == 3
+    assert "team{idkey}labels{nodes{id}}" in "".join(calls[0][0].split())
+    assert calls[0][1] == {"id": "ACR-1"}
+    assert "issueLabels(" in calls[1][0]
+    assert calls[1][1]["teamId"] == "team-1"
+    assert "issueUpdate(" in calls[2][0]
+    assert calls[2][1] == {
+        "id": "ACR-1",
+        "input": {"labelIds": ["existing-label", "requested-label"]},
+    }
+
+
+def test_apply_labels_cli_rejects_issue_team_mismatch_before_mutation(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record_property: Any,
+) -> None:
+    client = _client(monkeypatch)
+    calls: list[tuple[str, dict[str, Any]]] = []
+
+    def run(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((query, variables))
+        return {"data": {"issue": {
+            "team": {"id": "other-team", "key": "OTHER"},
+            "labels": {"nodes": [{"id": "existing-label"}]},
+        }}}
+
+    monkeypatch.setattr(client, "_run_graphql", run)
+    monkeypatch.setattr(linear_cli, "LinearClient", lambda: client)
+
+    with pytest.raises(SystemExit) as error:
+        linear_cli.main([
+            "apply-labels", "OTHER-1", "--team", "ACR", "--labels", "new-label",
+            "--create-missing",
+        ])
+
+    payload = json.loads(capsys.readouterr().out)
+    record_property("graphql_calls", json.dumps(calls))
+    record_property("cli_response", json.dumps(payload))
+    assert error.value.code == 1
+    assert payload["ok"] is False
+    assert payload["error"]["code"] == "INVALID_INPUT"
+    assert "Issue/team mismatch" in payload["error"]["message"]
+    assert len(calls) == 1
+    assert "team{idkey}labels{nodes{id}}" in "".join(calls[0][0].split())
+    assert calls[0][1] == {"id": "OTHER-1"}
+
+
+def test_create_issue_cli_repairs_missing_label_preserving_readback_assignment(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record_property: Any,
+) -> None:
+    client = _client(monkeypatch)
+    calls: list[tuple[str, dict[str, Any]]] = []
+    created_issue = {"id": "created-issue", "identifier": "ACR-2"}
+    responses = iter(
+        [
+            _page([_label("hardening", "requested-label")], has_next=False, cursor=None),
+            {"data": {"issueCreate": {"success": True, "issue": created_issue}}},
+            {"data": {"issue": {
+                **created_issue,
+                "description": "expected description",
+                "project": None,
+                "team": {"id": "team-1", "key": "ACR"},
+                "labels": {"nodes": [{"id": "existing-label", "name": "existing"}]},
+            }}},
+            {"data": {"issue": {
+                "team": {"id": "team-1", "key": "ACR"},
+                "labels": {"nodes": [{"id": "existing-label"}]},
+            }}},
+            _page([_label("hardening", "requested-label")], has_next=False, cursor=None),
+            {"data": {"issueUpdate": {"success": True, "issue": created_issue}}},
+        ]
+    )
+
+    def run(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        calls.append((query, variables))
+        return next(responses)
+
+    monkeypatch.setattr(client, "_run_graphql", run)
+    monkeypatch.setattr(linear_cli, "LinearClient", lambda: client)
+
+    linear_cli.main([
+        "create-issue", "--team", "ACR", "--title", "Title",
+        "--description", "expected description", "--label", "hardening",
+    ])
+
+    payload = json.loads(capsys.readouterr().out)
+    record_property("graphql_calls", json.dumps(calls))
+    record_property("cli_response", json.dumps(payload))
+    assert payload["ok"] is True
+    assert payload["data"]["id"] == created_issue["id"]
+    assert len(calls) == 6
+    assert "issueLabels(" in calls[0][0]
+    assert "issueCreate(" in calls[1][0]
+    assert calls[1][1] == {"input": {
+        "teamId": "team-1", "title": "Title", "description": "expected description",
+        "labelIds": ["requested-label"],
+    }}
+    assert "issue(id: $issueId)" in calls[2][0]
+    assert calls[2][1] == {"issueId": created_issue["id"]}
+    assert "team{idkey}labels{nodes{id}}" in "".join(calls[3][0].split())
+    assert calls[3][1] == {"id": created_issue["id"]}
+    assert "issueLabels(" in calls[4][0]
+    assert "issueUpdate(" in calls[5][0]
+    assert calls[5][1] == {
+        "id": created_issue["id"],
+        "input": {"labelIds": ["existing-label", "requested-label"]},
+    }
+
+
 @pytest.mark.parametrize(
     ("expected", "actual"),
     [
