@@ -55,7 +55,12 @@ def test_list_labels_reads_every_page(monkeypatch: pytest.MonkeyPatch) -> None:
         ]
     )
 
-    def run(_query: str, variables: dict[str, Any]) -> dict[str, Any]:
+    def run(query: str, variables: dict[str, Any]) -> dict[str, Any]:
+        assert (
+            "filter:{or:[{team:{id:{eq:$teamId}}},{team:{null:true}}]}"
+            in "".join(query.split())
+        )
+        assert variables["teamId"] == "team-1"
         calls.append(variables)
         return next(responses)
 
@@ -311,13 +316,15 @@ def test_create_issue_description_file_preserves_terminal_newlines(
     expected = "description\r\n\r\n"
     source.write_bytes(expected.encode())
     captured: dict[str, Any] = {}
+    created_issue = {"id": "issue-1", "identifier": "ACR-1"}
 
     class StubClient:
         def create_issue(self, **kwargs: Any) -> dict[str, str]:
             captured.update(kwargs)
-            return {"id": "issue-1", "identifier": "ACR-1"}
+            return created_issue
 
-        def get_issue(self, _issue_id: str) -> dict[str, str]:
+        def get_issue(self, issue_id: str) -> dict[str, str]:
+            assert issue_id == created_issue["id"]
             return {"description": expected}
 
     monkeypatch.setattr(linear_cli, "LinearClient", StubClient)
@@ -335,17 +342,19 @@ def test_create_issue_description_mismatch_blocks_without_second_create(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     calls = {"create": 0, "read": 0}
+    created_issue = {
+        "id": "issue-1",
+        "identifier": "ACR-1",
+        "url": "https://linear.app/issue/ACR-1",
+    }
 
     class StubClient:
         def create_issue(self, **_kwargs: Any) -> dict[str, str]:
             calls["create"] += 1
-            return {
-                "id": "issue-1",
-                "identifier": "ACR-1",
-                "url": "https://linear.app/issue/ACR-1",
-            }
+            return created_issue
 
-        def get_issue(self, _issue_id: str) -> dict[str, str]:
+        def get_issue(self, issue_id: str) -> dict[str, str]:
+            assert issue_id == created_issue["id"]
             calls["read"] += 1
             return {"description": "materially changed"}
 
