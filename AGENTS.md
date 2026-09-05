@@ -8,6 +8,37 @@ Routing precedence and conflict resolution live in [`~/ai/conventions/workflow-r
 
 Dispatch terminology: in RCA and bug workflows, "reproduce" means create a deterministic failure signal only when the input is symptom-only. When a failing test command, node ID, CI log, red-phase report, or structured failure already exists, that signal is the reproduction; carry it forward and run the same failing signal with the candidate fix instead of dispatching redundant reproduction work.
 
+## Mandatory General Landable-Change Lifecycle
+
+This section overrides the generic workflow-routing convention and the legacy catalog links below for any general task that produces a landable change to code or to a behavior-authoritative artifact; either is a `protected change` below. An artifact is behavior-authoritative by causal capability, not extension: configuration, agent instructions or prompts, workflow or routing definitions, migrations, deployment artifacts, and similar sources qualify when they can alter implementation, review, correction, merge, deployment, or runtime behavior. Ordinary prose or documentation that cannot alter behavior is not a protected change merely because it is text. This lifecycle applies regardless of ticket count and includes features, bug fixes, behavioral changes, and behavior-preserving refactors. Trigger-specific discovery or operational workflows may still run when their own cues apply, but any resulting protected change enters this lifecycle.
+
+Default implementation and correction for protected changes use directly dispatched ad-hoc agents in isolated worktrees. Do not route protected changes to `implementation-pipeline-orchestrator`, `feature-orchestrator`, or `refactoring-orchestrator`. Those orchestrators and their supporting workflow entries are non-routable legacy references unless the user explicitly requests one by name; explicit use does not replace or satisfy any gate in this section.
+
+De-routing those orchestrators removes their default machinery, not the delivery outcomes applicable to a task. Before implementation, the root must derive and freeze every applicable delivery obligation from the user request, ticket or brief, project policy, and exact task-specific contracts. These may include ticket lifecycle and readback, estimates, dependency and integration order, contract-bounded slicing, shim lifecycle, exact identity and worktree isolation, PR state, external-mutation authority, and final handoff. The root retains end-to-end accountability and must own each obligation or explicitly assign it to a direct ad-hoc agent; select only task-relevant outcomes rather than reconstructing a legacy orchestrator as an implicit fixed pipeline.
+
+The authoritative review policy is the current authoritative checkout under `/home/nes/projects/code-review-workflows`, particularly its `README.md`, `AGENTS.md`, and `risk-axis-reviewers/{README.md,orchestration-order.md,semantic-review-contract.md,review-scope-adapter-contract.md,decision-semantics.md}`. That repository exclusively defines reviewer selection, order, blindness, correction, evidence and identity handling, terminal interpretation, retirement, and completion semantics. Read and follow it for each review run; do not copy its reviewer definitions here, substitute a local workflow, or infer completion from this summary.
+
+The mandatory lifecycle is:
+
+1. Freeze an immutable problem contract and the applicable delivery obligations before implementation. If the problem contract changes, create a new problem generation and restart this lifecycle.
+2. Implement or discover the solution in an isolated worktree with focused ad-hoc implementation agents, then freeze the exact implementation identity and its authentic claims, source, configuration, tests, and supplied execution evidence using the identity and custody rules from Code Review Workflows.
+3. Before semantic product review, run a separate claim/evidence corrective phase against the frozen problem contract and exact implementation. It must decide whether the implementation and claimed solution satisfy the problem and whether discriminating evidence supports every material claim. Send every non-pass through the Code Review Workflows corrective handoff to a separate ad-hoc corrective agent; after any accepted correction, freeze a fresh immutable implementation identity and rerun this phase until its aggregate result is `PASS`.
+4. Run Code Review Workflows `unscoped corrective` against the exact identity that passed claim/evidence. Process the complete semantic product-reviewer cohort one reviewer at a time. A non-pass goes to a separate ad-hoc corrective agent; every accepted correction requires a fresh immutable identity, a renewed claim/evidence `PASS` for that identity, and a fresh blind generation of the current reviewer before advancement. Continue through the authoritative retirement and active-cohort completion rules until the full unscoped-corrective result is `PASS`.
+5. Run all required tests against the exact final head. Any correction, rebase, source/configuration/test change, or evidence change that alters the reviewed identity makes earlier identity-bound results stale; freeze the new identity and repeat both required Code Review Workflows gates as their policy requires.
+6. On the normal path, immediately before merge, verify that the exact head to be merged is the same immutable identity for which required tests, claim/evidence, the full unscoped-corrective lifecycle, and every applicable frozen delivery obligation were verified. Except when the evidence-triggered Governed Emergency Disposition below applies, merge no other identity and do not mutate it after the final verification.
+
+### Governed Emergency Disposition
+
+The root may activate this disposition only when frozen evidence establishes an exact active incident and that waiting for the complete normal review would itself create material ongoing restoration harm. Urgency or a severity label alone cannot activate it, and neither a subordinate agent, CodeRabbit, nor a legacy pipeline can activate or satisfy it. It is a one-off evidence-triggered disposition, not a fixed emergency pipeline or an automatic bypass. Activation uses only merge and rollback mutation authority already granted by the task and environment; the disposition cannot manufacture missing authority.
+
+Before merge, freeze an immutable emergency record identifying the restoration outcome and affected actors; one exact implementation identity and its bounded scope; the minimum incident-specific safety evidence; either one exact rollback action or explicitly bounded rollback identities; all remaining review debt; and exactly one named retrospective owner. Run and record every bounded test or check that can safely execute within the incident window. Record unavailable checks as explicit debt, never as inferred passes. The root retains the normal delivery-obligation ownership. Only the exact implementation identity in the record may merge as the emergency implementation. The same record governs rollback without an additional approval gate: rollback may execute only its exact recorded action or one of its bounded identities, including by merging a bounded rollback identity. If the authority already granted by the task and environment does not permit the merge or rollback, the disposition cannot execute that mutation.
+
+At emergency merge, that identity has not passed Code Review Workflows and remains untrusted. Preserve its pre-merge record and evidence without silent revision. Immediately after restoration, the retrospective owner must take the exact merged identity and preserved evidence through claim/evidence and then the full `unscoped corrective` lifecycle. Findings and corrections must land as separately frozen follow-up identities that complete the normal lifecycle before merge; they must not rewrite the emergency evidence or imply that the emergency identity passed review before its merge.
+
+CodeRabbit, reviewers or gates from the legacy implementation pipeline, and `~/ai/workflows/pr-review.md` are optional only when the user explicitly requests them. They never substitute for claim/evidence or unscoped-corrective review, make an unreviewed identity trusted, or activate the emergency disposition.
+
+Any previously merged protected change that has only legacy implementation-pipeline evidence and lacks both required Code Review Workflows results is high-risk and untrusted. Before treating it as a trusted baseline, extending it, or relying on it for release, retrospectively freeze its exact merged identity and pass it through both the claim/evidence corrective phase and the full `unscoped corrective` lifecycle; any retrospective correction creates a new identity subject to the same lifecycle and merge rule.
+
 ## Declared roles
 
 This file's classifications under `~/ai/conventions/code-quality.md` § Declared roles:
@@ -22,11 +53,7 @@ When the user says **"you are work manager"** (or any equivalent designation), o
 
 When in Work Manager mode, load the file matching the declared flavor at session start: `manager-max` -> `~/ai/agents/work-manager-operator-max.md`, `manager-pragmatic` -> `~/ai/agents/work-manager-operator-pragmatic.md`, `manager-hackerman` -> `~/ai/agents/work-manager-operator-hackerman.md`. Default to `manager-max` when no flavor is declared; in short, default to manager-max. Also read `~/ai/agents/work-manager-operator.md` as the Work Manager overview for filing discipline, dispatch discipline, delegation patterns, ticket-backend pluggability, and anti-scope.
 
-Strategy selection happens before single-WU dispatch. If the request decomposes into 2+ tickets, has a user-facing surface, or ships behavioral change, route to [`~/ai/workflows/feature-development.md`](workflows/feature-development.md) and [`~/ai/agents/feature-orchestrator.md`](agents/feature-orchestrator.md), using [`~/ai/conventions/feature-development-workflow.md`](conventions/feature-development-workflow.md) as the strategy convention. Otherwise fall through to the existing single-WU implementation-pipeline, roadmap, prototype, PR review, release, RCA, AGENTS maintenance, or other operator-table routes as applicable. Manager flavor remains orthogonal: max/pragmatic/hackerman selects risk posture inside child WUs and final review.
-
-If the request is internal structure reshape with no intended external behavior change and requires refactoring-specific safety topology (integration-buffer staging, contract-bounded slicing, encapsulate-first handling, shim lifecycle tracking), route to [`~/ai/workflows/refactoring.md`](workflows/refactoring.md) and [`~/ai/agents/refactoring-orchestrator.md`](agents/refactoring-orchestrator.md), using [`~/ai/conventions/refactoring-workflow.md`](conventions/refactoring-workflow.md). This refactoring rule takes precedence over the 2+ tickets heuristic above: a larger no-behavior-change refactor decomposes into separate one-child/one-PR refactoring WUs before dispatch, not an internal multi-child loop and not feature-development. Behavior-shipping work routes to feature-development regardless of ticket count. Manager flavor remains orthogonal.
-
-For startup routing, use [`~/ai/conventions/feature-development-workflow.md`](conventions/feature-development-workflow.md) `## Refactoring out of scope` as the feature/refactoring boundary reference.
+Strategy selection happens before dispatch. Any protected change, including one arising from multi-ticket work, user-facing or behavioral work, or an internal refactor, routes to the Mandatory General Landable-Change Lifecycle above and uses direct ad-hoc implementation and corrective agents rather than the three legacy delivery orchestrators. Continue to use roadmap, prototype, release, RCA, AGENTS maintenance, or another specialized route only when its specific trigger applies; any protected change still returns to the mandatory lifecycle. Manager flavor remains orthogonal: max/pragmatic/hackerman selects risk posture inside ad-hoc assignments and final disposition without replacing the required Code Review Workflows gates.
 
 ## Project Setup Pattern
 
@@ -190,7 +217,9 @@ Optimized contract sidecars live under `contracts/operators/` and `contracts/wor
 - `fastapi-best-practices` - Use as the FastAPI reviewer reference for architecture, contracts, state, and testing judgments in the secondary review.
   File: [~/ai/agents/fastapi-best-practices.md](agents/fastapi-best-practices.md) | Inputs: `reference doc only` | Model: `n/a`
 
-### Implementation pipeline orchestration
+### Legacy implementation pipeline orchestration
+
+These entries are retained as non-routable catalog documentation. Do not dispatch them for a protected change unless the user explicitly requests the legacy implementation pipeline; even then, they cannot satisfy or bypass the Mandatory General Landable-Change Lifecycle, activate the Governed Emergency Disposition, or merge their output before that lifecycle passes outside that disposition.
 
 - `apply-gate-set` - Own the active Phase 4/6/8 and RCA post-apply gate set, exact implementation identity transport, expected-process/trace audit, currentness joins, and stable hash-bound result envelope.
   File: [~/ai/agents/apply-gate-set.md](agents/apply-gate-set.md) | Inputs: `caller_mode`, repository/artifact roots, runtime cycle identity, exact base/head branch/ref/SHA for implementation modes, scope/runtime/contract/report hashes, mode-specific artifacts, output paths, and `local_coverage_command?` for Phase 8 | Model: `gpt-xhigh`
@@ -203,10 +232,14 @@ Optimized contract sidecars live under `contracts/operators/` and `contracts/wor
 
 ### Feature orchestration
 
+`feature-orchestrator` is retained as a non-routable legacy catalog reference. Do not dispatch it for general multi-ticket, user-facing, or behavioral work unless the user explicitly requests it by name, and do not treat its review or merge evidence as satisfying the mandatory Code Review Workflows gates.
+
 - `feature-orchestrator` - Coordinate one feature branch across backend-bound routed tickets using serialized attempts, route-discriminated direct operators/results, one exact-feature-branch common two-stage production process validator, closed hash-bound attempt-proof envelopes joined to the manifest/index/route result, caller-context-bound direct ticket evidence, verified refactoring merge identity, exact draft promotion, restoration-proved replay, route-specific merge ownership, and a verified final PR-open handoff.
   File: [~/ai/agents/feature-orchestrator.md](agents/feature-orchestrator.md) | Inputs: `feature_id`, `feature_scope_path`, `repo_root`, explicit `trunk_branch`, explicit `feature_branch`, `feature_worktree_path`, `child_worktrees_root`, `planning_dir`, `scratch_dir`, non-blank `local_coverage_command`, `scoped_ticket_list`, exactly one of `ticket_route_map?` or `successor_manifest_path?`, `ticket_system` plus matching backend configuration, `manager_flavor`, `acceptance_evidence_paths`, `post_merge_owner`, optional prototype/QA/evidence/audit-history context; runtime UUID is runner-derived | Model: `gpt-xhigh`
 
 ### Refactoring strategies
+
+`refactoring-orchestrator` is retained as a non-routable legacy catalog reference. Internal reshaping does not select it by default; dispatch it only when the user explicitly requests it by name, and do not treat its review or merge evidence as satisfying the mandatory Code Review Workflows gates. Other specialized refactoring catalog entries remain documented for their explicit triggers.
 
 - `refactoring-orchestrator` - Coordinate one contract-bounded refactoring WU, validate and pass the exact normalized branch/ticket/context/roots plus reviewed integration base to exactly one implementation child with auto-merge disabled, require integration/dispatched/observed/nested implementation base branch and fetched-ref names to match exactly even when OIDs coincide, require caller-context-bound ticket evidence and current implementation/refactoring-owned process-proof hashes, restore exact draft state before any pre-merge replay, solely own its one non-replayable guarded ticket-PR merge attempt, and return current audited `VERIFIED_MERGED` evidence.
   File: [~/ai/agents/refactoring-orchestrator.md](agents/refactoring-orchestrator.md) | Inputs: exactly one of `jira_issue_key?` / `linear_issue_key?` / `wu_brief_path?`, optional existing-issue-only `wu_brief_context_path?`, required `ticket_system` plus matching backend configuration, `target_list`, `repo_root`, unique short `branch_name`, `worktree_path`, `planning_dir`, `scratch_dir`, required boolean `feature_routed`, feature-route-required `local_coverage_command?`, exact short `trunk_branch`, short GitHub `integration_branch_ref`, canonical `protected_branches` containing both, `slice_bounds`, optional shim parameters/evidence, `shim_registry_path?` (default `~/ai/conventions/active-shims.md`), `audit_history_path?` (default `${planning_dir}/refactoring-audit-history.md`), `manager_flavor?`; runtime UUID is runner-derived | Model: `gpt-xhigh`
@@ -356,6 +389,12 @@ Never combine `-m <model>` with `-a <agent.md>`: `-m` shadows the frontmatter an
 
 For long-running or parallel child dispatch, [`~/ai/workflows/agents-cli.md`](workflows/agents-cli.md) is also the canonical dispatch/wait rule: use one Bash-background tool invocation per child, not shell `&`, bundled wrapper scripts, shell `wait`, PID waits, or trace-polling loops.
 
+### WAIT POLICY
+
+Root agents never manually poll live workloads or jobs with repeated status, list, trace, or sleep calls. Use native background completion notifications when available. When only polling exists, launch exactly one bounded background waiter for the already-running job and rely on that waiter's completion notification. The waiter stops on terminal success, failure, cancellation, or timeout; it only observes the job and must not dispatch agents, wrap or launch an `agents` invocation, or create duplicate ownership. After notification, one terminal status or readback is allowed solely to verify the outcome.
+
+The dispatch-shape prohibition below remains absolute: a waiter may observe an already-running job but may never wrap or launch an agent invocation.
+
 ### AGENT DISPATCH SHAPE
 
 `~/ai/workflows/agents-cli.md` is the canonical positive-shape source. A child dispatch stays as one parent-visible bash invocation:
@@ -389,9 +428,11 @@ All branch work runs in a git worktree; the central checkout is read-only / bran
 
 ## Workflow Topologies
 
-- Feature development (heterogeneous ticket routes and feature-branch integration): [`~/ai/workflows/feature-development.md`](workflows/feature-development.md)
-- Implementation pipeline (through Phase 9): [`~/ai/workflows/implementation-pipeline.md`](workflows/implementation-pipeline.md)
-- Refactoring (contract-bounded slices over an explicit integration branch): [`~/ai/workflows/refactoring.md`](workflows/refactoring.md)
+These are discoverability links, not default dispatch authority. The first three are non-routable legacy workflows for protected changes and require an explicit user request; they cannot replace the Mandatory General Landable-Change Lifecycle.
+
+- Legacy feature development (heterogeneous ticket routes and feature-branch integration): [`~/ai/workflows/feature-development.md`](workflows/feature-development.md)
+- Legacy implementation pipeline (through Phase 9): [`~/ai/workflows/implementation-pipeline.md`](workflows/implementation-pipeline.md)
+- Legacy refactoring (contract-bounded slices over an explicit integration branch): [`~/ai/workflows/refactoring.md`](workflows/refactoring.md)
 - RCA workflow (full reproduction-first root-cause analysis with four-agent split, verify-or-return, and incident-to-close downstream lifecycle): [`~/ai/workflows/rca.md`](workflows/rca.md)
 - Regression investigation (post-incident codebase-risk archaeology): [`~/ai/workflows/regression-investigation.md`](workflows/regression-investigation.md)
 - Prototype RCA workflow (light two-agent root-cause/fix loop for one failed prototype trigger): [`~/ai/workflows/rca-prototype.md`](workflows/rca-prototype.md)
@@ -454,12 +495,12 @@ Project-specific operator wrappers live in `<project>/trunk/agents/`, reference 
 
 ### Per-Project Policy
 
-A project's own `AGENTS.md` declares the per-project policy knobs the orchestrator and ticket operator read at dispatch time:
+A project's own `AGENTS.md` declares ticket-backend policy and, when explicitly requested, legacy implementation-pipeline knobs:
 
-- `ticket_system`: `jira` or `linear` — selects the ticket backend per [`~/ai/agents/implementation-pipeline-orchestrator.md`](agents/implementation-pipeline-orchestrator.md) § Ticket System Pluggability.
+- `ticket_system`: `jira` or `linear` — selects the ticket backend for ticket-capable workflows. For an explicitly requested legacy implementation pipeline, see [`~/ai/agents/implementation-pipeline-orchestrator.md`](agents/implementation-pipeline-orchestrator.md) § Ticket System Pluggability.
 - Linear projects declare `linear_team_key` (and optionally `linear_project_id`).
 - Jira projects may declare project policy values, but category-local Jira execution defaults should live in the project wrapper contract when a wrapper exists.
-- `skip_problem_map_gate` (boolean, default `false`) — see the orchestrator file's Optional Inputs.
-- `auto_merge_after_phase_9` (boolean, default `true`) — see the orchestrator file's Optional Inputs. Default-on; foreign repos opt out via their `AGENTS.md`.
+- `skip_problem_map_gate` (legacy implementation pipeline only; boolean, default `false`) — see the orchestrator file's Optional Inputs. This setting never selects the pipeline or skips the frozen problem contract above.
+- `auto_merge_after_phase_9` (legacy implementation pipeline only; historical default `true`) — see the orchestrator file's Optional Inputs. This default is not merge authority for protected changes: an explicitly requested legacy pipeline that produces a protected change must set it to `false` and hand its exact output identity to the Mandatory General Landable-Change Lifecycle.
 
-Semantics for each knob live on the orchestrator's input contract; the project `AGENTS.md` only declares the chosen values.
+Semantics for each legacy knob live on the orchestrator's input contract; the project `AGENTS.md` only declares the chosen values. Declaring a legacy knob does not make the corresponding orchestrator routable.
