@@ -1,6 +1,6 @@
 schema: operator-contract-v1
 source: agents/linear-operator.md
-model: gpt-medium
+model: gpt-luna-high
 description: Read/comment/create/transition Linear issues via the ported Linear client at ~/ai/clients/linear/. Auth via $LINEAR_API_KEY env var.
 estimate_mutation_enabled: false
 inputs:

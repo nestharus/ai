@@ -393,7 +393,7 @@ The orchestrator supports two ticket backends and dispatches to the matching ope
 | Ticket system | Issue-key input | Operator | Description format |
 |---|---|---|---|
 | JIRA (Atlassian) | `jira_issue_key` | resolved project wrapper when present and current, otherwise `~/ai/agents/jira-operator.md` (gpt-xhigh) | ADF JSON |
-| Linear | `linear_issue_key` | `~/ai/agents/linear-operator.md` (gpt-xhigh) | Markdown native |
+| Linear | `linear_issue_key` | `~/ai/agents/linear-operator.md` (gpt-luna-high) | Markdown native |
 
 **Detection rule:** if both `jira_issue_key` and `linear_issue_key` are supplied, return `BLOCKED:exactly-one-ticket-system-required`. Otherwise, if `jira_issue_key` (or `wu_brief_path` with `ticket_system=jira`) is provided, all ticket dispatches use the resolved Jira operator and its resolved contract inputs. If `linear_issue_key` (or `wu_brief_path` with `ticket_system=linear`) is provided, all ticket dispatches use `linear-operator` and Linear inputs (`linear_team_key`, optional `linear_project_id`) resolved through the same operator-contract rule. `linear_team_key` is passed through for team-scoped create, list, and search linear-operator dispatches. For Linear, `linear_project_id` is the retained input name, but the value may be a project UUID or `slugId` resolved by `linear-operator`; when supplied, it is passed through to create dispatches and issue-query dispatches that should be scoped to a project. Known-issue-key read/comment dispatches do not require separate team selection because the issue identifier carries the team identity. Exactly one system must be selected per WU; cross-system handoff is not supported within a single WU.
 

@@ -179,7 +179,7 @@ The manager supports two ticket backends and dispatches to the matching operator
 | Ticket system | Issue-key input | Operator | Description format |
 |---|---|---|---|
 | JIRA (Atlassian) | `jira_issue_key` | `~/ai/agents/jira-operator.md` (gpt-medium) | ADF JSON |
-| Linear | `linear_issue_key` | `~/ai/agents/linear-operator.md` (gpt-medium) | Markdown native |
+| Linear | `linear_issue_key` | `~/ai/agents/linear-operator.md` (gpt-luna-high) | Markdown native |
 
 **Detection rule:** if `jira_issue_key` (or a cold-start brief with `ticket_system=jira`) is provided, all ticket dispatches use `jira-operator` and JIRA inputs (`jira_url`, `jira_project`, `jira_account_email`). If `linear_issue_key` (or a cold-start brief with `ticket_system=linear`) is provided, all ticket dispatches use `linear-operator` and Linear inputs (`linear_team_key`, optional `linear_project_id`). Exactly one ticket system, and therefore one backend, must be selected per WU/session; cross-system handoff is not supported within a single WU or manager session.
 

@@ -18,6 +18,7 @@ Do not restate the matrix there.
 | `gpt-high` | **Default.** Proposer/builder/auditor/writer. | RCA evidence gathering, research, most synthesis, proposals, hookpoint analysis, implementation, test writing, audit risk, behavior investigation, commit hygiene, test-audit gate, multi-concern PR review, justification PR review, ticket prose, PR prose, and roadmap ticket-file generation. Use it for work that gathers evidence, enumerates cases, builds artifacts, checks presence against a checklist, or writes external-facing prose unless a workflow/operator names a narrower exception. |
 | `gpt-xhigh` | Orchestrators, deep-reasoning auditors, alignment, and risk-assessment work. | All `*-orchestrator` operators that route a workflow end-to-end; verification-plan review, scope risk, shortcut risk, supported-surface risk, coverage audit, risk assessor, philosophy/problem alignment, workflow reviewer, agent-design / workflow-design / workflow-process auditors, work-manager ticket-brief auditor, rebase-drift-checker; multi-file proposals spanning subsystems; research that needs deep reasoning across many sources before delegation; strategic synthesis where reasoning depth is the bottleneck. |
 | `gpt-medium` | Fast, structured per-comment automation. | CodeRabbit operator + per-comment fixer driving the PR-mode review loop. |
+| `gpt-luna-high` | Linear ticket operations. | `linear-operator` uses this registered model alias for its structured ticket operations. |
 
 ## Phase-by-phase assignment (implementation pipeline)
 
