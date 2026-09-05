@@ -422,6 +422,14 @@ For a concrete story-point value, the optional flag is `--estimate 5` (`--estima
 
 `--project` accepts an existing project UUID or `slugId`, resolved against `${linear_team_key}` before create. Missing project tokens raise `NOT_FOUND`; duplicate `slugId` matches across distinct projects raise `AMBIGUOUS_PROJECT`. Project names and URLs are not accepted identifiers.
 
+**Parent linking.** The CLI `create-issue` path does not expose a `--parent` flag. If parent linkage is required and the parent UUID is known, call the underlying Python client `update_issue(..., parent_id=<parent-uuid>)` after creation; if only an ambiguous parent key/reference is available, return `NEEDS_INPUT` with the requested parent reference rather than silently dropping it.
+
+**Label conventions.** When creating tickets, apply project label conventions per `${linear_team_key}`'s setup:
+
+- Risk-reduction / hardening tickets: label `hardening`. Check the project's `AGENTS.md` for the term it prefers (`hardening`, `risk-reduction`).
+- Per-project labels (e.g. `~/ai`, `oulipoly`, `workflow`): from the project's routing rules. ~/ai itself uses the `~/ai` label.
+- Per-initiative labels (e.g. `segmentation`, `workspace-split`): apply alongside the kind label.
+
 Returns `{"ok": true, "data": {"id": "<uuid>", "identifier": "${linear_team_key}-NNN", "url": "..."}}`. Before reporting success for either a newly created or duplicate-reused issue, compare the stored description with the source brief:
 
 ```bash
@@ -450,14 +458,6 @@ PYTHONPATH=$HOME/ai python3 -m clients.linear.cli list-projects \
 ```
 
 Returns the standard JSON envelope with projects under `data.projects[]`. Parse `id`, `slugId`, `name`, and `archivedAt` (when present) when selecting a project to pass as `linear_project_id`.
-
-**Parent linking.** The CLI `create-issue` path does not expose a `--parent` flag. If parent linkage is required and the parent UUID is known, call the underlying Python client `update_issue(..., parent_id=<parent-uuid>)` after creation; if only an ambiguous parent key/reference is available, return `NEEDS_INPUT` with the requested parent reference rather than silently dropping it.
-
-**Label conventions.** When creating tickets, apply project label conventions per `${linear_team_key}`'s setup:
-
-- Risk-reduction / hardening tickets: label `hardening`. Check the project's `AGENTS.md` for the term it prefers (`hardening`, `risk-reduction`).
-- Per-project labels (e.g. `~/ai`, `oulipoly`, `workflow`): from the project's routing rules. ~/ai itself uses the `~/ai` label.
-- Per-initiative labels (e.g. `segmentation`, `workspace-split`): apply alongside the kind label.
 
 ## Procedure: List Labels
 
