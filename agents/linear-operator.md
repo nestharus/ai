@@ -199,14 +199,14 @@ You read, comment on, create, and transition Linear issues using the ported Line
 
 ## Execution Boundary
 
-`must_delegate: linear-writes` is a caller boundary: callers delegate Linear writes to this operator. Once selected, this operator is the terminal executor for the requested Linear operation. It must invoke the matching `clients.linear.cli` command directly and must never dispatch `linear-operator.md`, another agent, or another workflow to perform the same operation. A running nested write is not a successful result.
+`must_delegate: linear-writes` is a caller boundary: callers delegate Linear writes to this operator. Once selected, this operator is the terminal executor for the requested Linear operation. It must invoke the matching `clients.linear.cli` command directly (through the mandatory admission helper below for `update-estimate`) and must never dispatch `linear-operator.md`, another agent, or another workflow to perform the same operation. A running nested write is not a successful result.
 
 The task mapping is closed: `read` uses `get-issue`; `comment` uses `create-comment`; `create` uses `search-issues` followed by at most one `create-issue`; `update-estimate` first applies the selected-contract admission in Procedure: Update Estimate, then uses `update-issue` and the documented comment path only when admitted; `transition` uses `transition-issue`; `search` uses `search-issues`; `list-issues` uses `list-issues`; `list-projects` uses `list-projects`; `list-labels` uses `list-labels`; `create-label` uses `create-label`; `apply-labels` uses `apply-labels`; and `upsert-comment` uses `upsert-comment`. Return success only after the admitted direct operation and required readback are terminal.
 
 ## Required Inputs
 
 - `task`: one of `read`, `comment`, `create`, `update-estimate`, `transition`, `search`, `list-issues`, `list-projects`, `list-labels`, `create-label`, `apply-labels`, `upsert-comment`; `task=read` is the Phase 0 bootstrap read path and `task=upsert-comment` is the idempotent comment path.
-- `task=update-estimate`: backend-neutral estimate refinement write-back. Inputs: `issue_key`, `estimate`, `inherited_story_point_estimate`, `estimate_source`, `estimate_delta_rationale`, and `estimate_delta_flag`. Apply Procedure: Update Estimate's selected-contract admission before invoking `clients.linear.cli update-issue "${issue_key}" --estimate <int>` for the numeric field update or writing its durable Markdown note through the existing comment/upsert-comment path. The note contains inherited estimate, refined estimate, source, and delta rationale. This task must not transition workflow status/state.
+- `task=update-estimate`: backend-neutral estimate refinement write-back. Inputs: `issue_key`, `estimate`, `inherited_story_point_estimate`, `estimate_source`, `estimate_delta_rationale`, and `estimate_delta_flag`. Execute the numeric update and its durable Markdown note through Procedure: Update Estimate's mandatory admission helper, which guards the existing update/comment CLI operations. The note contains inherited estimate, refined estimate, source, and delta rationale. This task must not transition workflow status/state.
 - `issue_key`: e.g., `AGE-34` or `${linear_team_key}-34` (required for known-issue-key `read`/`comment`, `transition`, and `apply-labels`).
 - `target_status` (for `transition`): destination state name for the routine manager-owned path. The closed routine set is exactly `Todo`, `In Progress`, and `Done`, sourced from `clients.linear.client.ROUTINE_MANAGER_OWNED_STATES`; out-of-set values are out-of-contract and the operator returns `BLOCKED`.
 - `body` (for `comment`): markdown body — Linear renders Markdown natively, no ADF.
@@ -331,15 +331,27 @@ Before running the numeric update or writing its refinement note, resolve estima
 3. `estimate_mutation_enabled` is selected-contract policy, never an operator input or a default supplied by the caller. Reject caller/session overrides, non-boolean values, duplicate declarations, and conflicting declarations in the selected contract as `BLOCKED:estimate-mutation-policy-invalid`. A current selected wrapper's explicit policy takes precedence over the base policy; an enabled wrapper over a disabled base is not itself a conflict. Do not treat the inherited base procedure's embedded contract as the selected wrapper contract.
 4. An exact boolean `false` returns `BLOCKED:estimate-mutation-policy-disabled` without a numeric update or refinement note. An exact boolean `true` admits the existing procedure below. If policy is absent, retain the existing `legacy_capability` admission only when the selected contract, with its normal capability inheritance, advertises both `task=update-estimate` in `outputs` and `linear-update-estimate` in `side_effects`; otherwise return `BLOCKED:estimate-mutation-policy-unresolved`. Never infer permission from the requested task, estimate value, prior dispatch, session state, or credential availability.
 
-Only after admission, execute the existing update directly:
+Execute admission and each protected operation together using `clients.linear.estimate_admission`. Set the internal `governing_definition` locator to the absolute source path of the definition already governing this invocation under step 1; it is not a new operator input, caller override, or permission source. The helper derives the sidecar from that definition, parses YAML with duplicate-key rejection, validates source binding and typed embedded/sidecar equivalence, and checks policy before calling the existing CLI. It reads the contract again for each protected operation. A nonzero result blocks that operation; never retry it through the raw CLI.
+
+The governing-definition selection remains this procedure's responsibility. The helper enforces admission on this path; it does not authenticate an arbitrary path against runner state, and independent raw `clients.linear.cli` calls do not inspect operator policy.
+
+Run the numeric update through the guard:
 
 ```bash
-PYTHONPATH=$HOME/ai python3 -m clients.linear.cli update-issue \
-    "${issue_key}" \
-    --estimate <int>
+PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
+    --definition "${governing_definition}" -- \
+    update-issue "${issue_key}" --estimate "${estimate}"
 ```
 
-After the numeric update succeeds, write a durable Markdown note through the existing comment/upsert-comment procedure. The note must contain inherited estimate, refined estimate, source, and delta rationale, and may include the verbatim `estimate_delta_flag` for audit evidence. Parse both command envelopes and return `BLOCKED` on any 4xx, auth, not-found, or `INVALID_INPUT` failure. This task does not transition status/state.
+After the numeric update succeeds, compose `refinement_note` with inherited estimate, refined estimate, source, and delta rationale; it may include the verbatim `estimate_delta_flag` for audit evidence. Write it through the same guard:
+
+```bash
+PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
+    --definition "${governing_definition}" -- \
+    create-comment "${issue_key}" --body "${refinement_note}"
+```
+
+When using the existing idempotent note path, replace only the command after `--` with `upsert-comment "${issue_key}" --title "Estimate refinement" --body "${refinement_note}"`; retain the same governing definition and guard. Parse both command envelopes and return `BLOCKED` on any policy, 4xx, auth, not-found, or `INVALID_INPUT` failure. This task does not transition status/state.
 
 ## Procedure: Comment
 
