@@ -193,9 +193,7 @@ def list_comments(issue_id: str) -> None:
     """List and print comments on an issue as JSON."""
     client = LinearClient()
     result = client.list_comments(issue_id)
-    # Extract comments list from rich metadata to preserve CLI contract
-    comments = result.get("comments", [])
-    print(json.dumps({"ok": True, "data": {"comments": comments}}, indent=2))
+    print(json.dumps({"ok": True, "data": result}, indent=2))
 
 
 def create_issue(

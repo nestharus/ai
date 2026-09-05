@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import io
 import json
+import urllib.request
 from pathlib import Path
 from typing import Any
 
@@ -568,3 +570,79 @@ def test_issue_mutations_reject_conflicting_description_inputs(operation: Any) -
 
     assert error.value.code == "INVALID_INPUT"
     assert "mutually exclusive" in str(error.value)
+
+
+def test_list_comments_cli_preserves_issue_identity_across_pages(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    record_property: Any,
+) -> None:
+    issue_id = "57c4f289-c39e-4d13-87bd-7ae56f01854b"
+    issue_key = "ACR-390"
+    comments = [
+        {
+            "id": "e8d99e44-248c-4c53-9c80-19a413d909bd",
+            "body": "First page comment\n",
+            "createdAt": "2026-09-01T12:00:00Z",
+            "updatedAt": "2026-09-01T12:00:00Z",
+            "user": None,
+        },
+        {
+            "id": "e0067d16-64cc-4aee-88cc-8393f701fa79",
+            "body": "Second page comment\n",
+            "createdAt": "2026-09-02T12:00:00Z",
+            "updatedAt": "2026-09-02T12:00:00Z",
+            "user": {"id": "user-1", "name": "Reader", "email": "reader@example.test"},
+        },
+    ]
+    responses = iter([
+        {"data": {"issue": {
+            "id": issue_id, "identifier": issue_key,
+            "comments": {
+                "nodes": [comments[0]],
+                "pageInfo": {"hasNextPage": True, "endCursor": "comment-page-2"},
+            },
+        }}},
+        {"data": {"issue": {
+            "id": issue_id, "identifier": issue_key,
+            "comments": {
+                "nodes": [comments[1]],
+                "pageInfo": {"hasNextPage": False, "endCursor": None},
+            },
+        }}},
+    ])
+    calls: list[dict[str, Any]] = []
+
+    def transport(request: urllib.request.Request, timeout: int) -> io.BytesIO:
+        calls.append(json.loads(request.data))
+        assert request.get_method() == "POST"
+        assert request.full_url == "https://api.linear.app/graphql"
+        assert request.get_header("Authorization") == "public-comment-fixture-key"
+        assert timeout == 30
+        return io.BytesIO(json.dumps(next(responses)).encode("utf-8"))
+
+    monkeypatch.setenv("LINEAR_API_KEY", "public-comment-fixture-key")
+    monkeypatch.setattr(urllib.request, "urlopen", transport)
+
+    try:
+        linear_cli.main(["list-comments", issue_key])
+    finally:
+        captured = capsys.readouterr()
+        record_property("graphql_calls", json.dumps(calls))
+        record_property("cli_stdout", captured.out)
+        record_property("cli_stderr", captured.err)
+
+    payload = json.loads(captured.out)
+    assert len(calls) == 2
+    assert next(responses, None) is None
+    assert all("query IssueComments(" in call["query"] for call in calls)
+    assert all("comments(first: 100, after: $after)" in call["query"] for call in calls)
+    assert [call["variables"] for call in calls] == [
+        {"id": issue_key},
+        {"id": issue_key, "after": "comment-page-2"},
+    ]
+    assert payload["ok"] is True
+    assert payload["data"]["comments"] == comments
+    assert payload["data"]["issueId"] == issue_id
+    assert payload["data"]["issueIdentifier"] == issue_key
+    assert payload["data"]["totalCount"] == 2
