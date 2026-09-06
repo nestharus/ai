@@ -104,6 +104,33 @@ class LinearClientError(Exception):
         super().__init__(f"{code}: {message}")
 
 
+def _search_issue_nodes(result: dict[str, Any]) -> list[Any]:
+    """Require a search collection instead of interpreting unreadable data as empty."""
+    data = result.get("data")
+    issues = data.get("issues") if isinstance(data, dict) else None
+    nodes = issues.get("nodes") if isinstance(issues, dict) else None
+    if not isinstance(nodes, list):
+        raise LinearClientError(
+            "INVALID_RESPONSE", "Linear search response requires data.issues.nodes as a list"
+        )
+    return nodes
+
+
+def _validate_search_issue_identity(node: Any) -> None:
+    """Reject unreadable candidates before callers can filter them into absence."""
+    if not isinstance(node, dict):
+        raise LinearClientError("INVALID_RESPONSE", "Linear search issue must be an object")
+    invalid = [
+        field for field in ("id", "identifier", "title", "url")
+        if not isinstance(node.get(field), str) or not node[field].strip()
+    ]
+    if invalid:
+        raise LinearClientError(
+            "INVALID_RESPONSE",
+            "Linear search issue requires non-blank strings: " + ", ".join(invalid),
+        )
+
+
 class LinearClient:
     """Python client for the Linear GraphQL API.
 
@@ -1795,7 +1822,8 @@ query IssueUnresolvedComments($id: String!, $after: String) {
 
         Raises:
             LinearClientError: ``INVALID_INPUT`` for invalid arguments,
-                ``NOT_FOUND`` when a team key cannot be resolved, and
+                ``NOT_FOUND`` when a team key cannot be resolved,
+                ``INVALID_RESPONSE`` for unreadable search collections or candidates, and
                 ``API_ERROR``, ``PARSE_ERROR``, or ``GRAPHQL_ERROR`` propagated
                 from the GraphQL transport.
         """
@@ -1878,14 +1906,11 @@ query IssueUnresolvedComments($id: String!, $after: String) {
                 "includeArchived": include_archived,
             },
         )
-        nodes = result.get("data", {}).get("issues", {}).get("nodes", [])
-        if not isinstance(nodes, list):
-            return []
+        nodes = _search_issue_nodes(result)
 
         issues: list[dict[str, Any]] = []
         for node in nodes:
-            if not isinstance(node, dict):
-                continue
+            _validate_search_issue_identity(node)
             if "labels" not in node or node.get("labels") is None:
                 identifier = node.get("identifier") or node.get("id") or "<unknown>"
                 raise LinearClientError(
