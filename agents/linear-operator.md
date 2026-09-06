@@ -199,7 +199,7 @@ You read, comment on, create, and transition Linear issues using the ported Line
 
 ## Execution Boundary
 
-`must_delegate: linear-writes` is a caller boundary: callers delegate Linear writes to this operator. Once selected, this operator is the terminal executor for the requested Linear operation. It must invoke the matching `clients.linear.cli` command directly (through the mandatory admission helper below for `update-estimate`) and must never dispatch `linear-operator.md`, another agent, or another workflow to perform the same operation. A running nested write is not a successful result.
+`must_delegate: linear-writes` is a caller boundary: callers delegate Linear writes to this operator. Once selected, this operator is the terminal executor for the requested Linear operation. It must invoke the matching `clients.linear.cli` command directly (through the mandatory admission helper below for `update-estimate`) and must never dispatch `linear-operator.md`, another agent, or another workflow to perform the same operation. For `update-estimate`, a failed command ends this invocation through the terminal `BLOCKED` branch below; an asynchronous handle or "Dispatching" response is not completion.
 
 The task mapping is closed: `read` uses `get-issue`; `comment` uses `create-comment`; `create` uses `search-issues` followed by at most one `create-issue`; `update-estimate` first applies the selected-contract admission in Procedure: Update Estimate, then uses `update-issue` and the documented comment path only when admitted; `transition` uses `transition-issue`; `search` uses `search-issues`; `list-issues` uses `list-issues`; `list-projects` uses `list-projects`; `list-labels` uses `list-labels`; `create-label` uses `create-label`; `apply-labels` uses `apply-labels`; and `upsert-comment` uses `upsert-comment`. Return success only after the admitted direct operation and required readback are terminal.
 
@@ -331,11 +331,16 @@ Before running the numeric update or writing its refinement note, resolve estima
 3. `estimate_mutation_enabled` is selected-contract policy, never an operator input or a default supplied by the caller. Reject caller/session overrides, non-boolean values, duplicate declarations, and conflicting declarations in the selected contract as `BLOCKED:estimate-mutation-policy-invalid`. A current selected wrapper's explicit policy takes precedence over the base policy; an enabled wrapper over a disabled base is not itself a conflict. Do not treat the inherited base procedure's embedded contract as the selected wrapper contract.
 4. An exact boolean `false` returns `BLOCKED:estimate-mutation-policy-disabled` without a numeric update or refinement note. An exact boolean `true` admits the existing procedure below. If policy is absent, retain the existing `legacy_capability` admission only when the selected contract, with its normal capability inheritance, advertises both `task=update-estimate` in `outputs` and `linear-update-estimate` in `side_effects`; otherwise return `BLOCKED:estimate-mutation-policy-unresolved`. Never infer permission from the requested task, estimate value, prior dispatch, session state, or credential availability.
 
-Execute admission and each protected operation together using `clients.linear.estimate_admission`. Set the internal `governing_definition` locator to the absolute source path of the definition already governing this invocation under step 1; it is not a new operator input, caller override, or permission source. The helper derives the sidecar from that definition, parses YAML with duplicate-key rejection, validates source binding and typed embedded/sidecar equivalence, and checks policy before calling the existing CLI. It reads the contract again for each protected operation. A nonzero result blocks that operation; never retry it through the raw CLI.
+Execute admission and each protected operation together using `clients.linear.estimate_admission`. Set the internal `governing_definition` locator to the absolute source path of the definition already governing this invocation under step 1; it is not a new operator input, caller override, or permission source. The helper derives the sidecar from that definition, parses YAML with duplicate-key rejection, validates source binding and typed embedded/sidecar equivalence, and checks policy before calling the existing CLI. It reads the contract again for each protected operation.
 
 The governing-definition selection remains this procedure's responsibility. The helper enforces admission on this path; it does not authenticate an arbitrary path against runner state, and independent raw `clients.linear.cli` calls do not inspect operator policy.
 
-Run the numeric update through the guard:
+Run each guarded command synchronously. Before proceeding, inspect that command's own exit status and parse its JSON envelope; output capture must preserve the command's status. Apply these closed branches separately to the numeric update and the refinement note:
+
+- **Failure:** Any nonzero exit, `ok: false`, missing or malformed envelope, or envelope without exact boolean `ok: true` ends this invocation as `BLOCKED`. Identify the failed stage and retain the underlying error code and message when available. For missing or malformed output, report that condition and the observed exit status without inventing a backend error. This applies to every error class, including unknown classes. Stop here: do not delegate, substitute a wrapper, or retry the operation through the guard, raw CLI, or another path.
+- **Success:** Only exit zero with a valid success envelope permits the next step for that stage below. A command error does not establish whether a remote mutation occurred; report only the outcome supported by its result.
+
+Run the numeric update through the guard and apply those branches to its result:
 
 ```bash
 PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
@@ -343,7 +348,7 @@ PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
     update-issue "${issue_key}" --estimate "${estimate}"
 ```
 
-After the numeric update succeeds, compose `refinement_note` with inherited estimate, refined estimate, source, and delta rationale; it may include the verbatim `estimate_delta_flag` for audit evidence. Write it through the same guard:
+If the numeric update fails, return `BLOCKED` for the numeric stage and state that the refinement note was not attempted. Only after numeric success, retain that result and compose `refinement_note` with inherited estimate, refined estimate, source, and delta rationale; it may include the verbatim `estimate_delta_flag` for audit evidence. Write it through the same guard and apply the branches above to this command's own result:
 
 ```bash
 PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
@@ -351,7 +356,7 @@ PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
     create-comment "${issue_key}" --body "${refinement_note}"
 ```
 
-When using the existing idempotent note path, replace only the command after `--` with `upsert-comment "${issue_key}" --title "Estimate refinement" --body "${refinement_note}"`; retain the same governing definition and guard. Parse both command envelopes and return `BLOCKED` on any policy, 4xx, auth, not-found, or `INVALID_INPUT` failure. This task does not transition status/state.
+When using the existing idempotent note path, replace only the command after `--` with `upsert-comment "${issue_key}" --title "Estimate refinement" --body "${refinement_note}"`; retain the same governing definition, guard, and result branches. If the note fails, return `BLOCKED` for the note stage and report the retained numeric success separately; do not claim rollback or a successful note. Return task success only after both stages succeed. This task does not transition status/state.
 
 ## Procedure: Comment
 
@@ -554,7 +559,7 @@ Both CLI commands return the standard JSON envelope. Parse `identifier`, `title`
 For `read`: write the rendered ticket to `output_path`; print the key, title, state, parent in a brief block.
 For `comment`: when `operation` is omitted, print the new comment ID + a confirmation line; when `operation=comment-readback`, atomically write the producer log to `producer_log_path`, the readback projection to `producer_output_path`, and the `ticket-operation-result-v1` result to `operation_result_path`, then return that structured result.
 For `create`: after description readback returns `MATCH`, print the created or duplicate-reused key + URL.
-For `update-estimate`: print the issue key, refined estimate, and comment ID for the durable Markdown note.
+For `update-estimate`: after both stages succeed, print the issue key, refined estimate, and comment ID for the durable Markdown note. Otherwise return the terminal `BLOCKED` result from Procedure: Update Estimate, identifying the failed stage, observed error, and known outcome of each stage. An asynchronous handle or dispatch status is not a terminal task result.
 For `list-projects`: print one line per result (`ID  state  name`, omitting blank state).
 For `list-labels`: print one line per result (`ID  name`).
 For `create-label`: print the new label ID + name.
