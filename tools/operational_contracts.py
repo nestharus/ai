@@ -2748,6 +2748,9 @@ def validate_ticket_operation_result(
         if result_identity in support_paths:
             errors.append("ticket operation result must not self-reference as producer evidence")
 
+    # These support artifacts are operation/readback identity projections.
+    # Hashes and equality checks bind their bytes and asserted identities;
+    # they do not authenticate transcripts, request order or remote execution.
     producer_log: dict[str, Any] = {}
     if producer_log_path is not None:
         try:
