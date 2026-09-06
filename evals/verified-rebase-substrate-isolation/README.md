@@ -7,61 +7,68 @@ PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s evals/verified-rebase-
 ```
 
 Requires Linux/local-filesystem `flock`, Python 3.10+, Git with
-`merge-tree --write-tree --merge-base`, jj colocated Git support, Bash and jq.
-The fixtures create independent temporary repositories and local bare remotes;
-no network remote, incident substrate, production branch or agent is invoked.
-Pipes synchronize real worker processes; no timing sleeps or mocked lock model.
-Fixture Git commits disable signing only inside those disposable repositories.
+`merge-tree --write-tree --merge-base`, jj colocated Git support and JSON
+operation/bookmark templates, Bash and jq. The conflict serialization/CLI
+adapter is exercised with jj 0.39.0 and Git 2.43.0. Unknown serialization,
+unsupported path renderings or conflict modes fail closed, not via ignored paths.
+Fixtures use independent system-temp repositories and local bare remotes;
+no network remote, production substrate or agent is invoked. Fixture Git commits
+disable signing only inside those disposable repositories. Pipes synchronize
+real worker processes without sleeps or a simulated ownership model.
 
-## Executed surface
+## Runnable surface
 
-Tests call the actual `tools/verified_rebase.py` implementation. One test extracts
-and executes the **checked-in** workflow phase 1–7 shell blocks and generates the
-phase 10 rollback template with quoted literals. Thus it exercises the real
-allocation/CLI wiring, ort capture, jj rebase, raw conflict-row adapter, diffs and
-fenced rollback, not a second implementation of those snippets.
+Tests load the same-checkout `tools/verified_rebase.py` and execute the checked-in
+workflow shell blocks through terminal production and release. They inspect the
+actual summary, refs, patches, conflict payloads/associations, correspondence,
+raw storage and logical trees, parent bundle links and generated rollback script.
+Mechanical labels in negative calls are assertions to reject, not producer input.
 
-The named assertions cover:
+The fixtures cover:
 
-- overlap, different branches sharing a substrate, canonical path aliases,
-  suspended owner and successful process exit without reservation release;
-- exclusive owner/attempt bundle creation (no branch-slug collision), blocked
-  preflight without a `.gitignore` repair or checkout artifact;
-- simultaneously rebasing independent substrates, and live independent attempts
-  for `a/b`, `a_b`, `a__b`;
-- partial reservation/state, interruption after actual rebase before receipt,
-  completed-rebase resume with no replay, and terminal-before-release ownership;
-- stale cleanup/release/rollback against a successor, including a successor that
-  changed no refs; current/foreign commit cleanup rejection;
-- rollback after a later clean jj operation or anchor replacement versus current
-  rollback/repeated validated no-op; unrelated cwd and unchanged remote refs;
-- eight incident-shaped foreign paths preserved byte-for-byte and not jj-
-  snapshotted; `mechanical=CLEAN` remains `execution=BLOCKED`, never push-eligible;
-- late evidence/source changes preventing release after terminal recording;
-- conflict-free tree/range correspondence, no-op, unresolved text conflict,
-  stacked child parent-tip equality and scoped stale-parent-history rebase.
+- overlapping owners, different branches sharing a substrate, aliases, suspended
+  ownership and successful process exit without release;
+- exclusive UUID allocation, blocked preflight with no ignore repair, independent
+  simultaneous attempts, partial records and interrupted commands;
+- stale release/cleanup/rollback, current rollback/repeated validated no-op,
+  unexpected foreign files preserved without snapshot, and late evidence changes;
+- actual command-return/checkpoint barriers for anchor, fetch, rebase, rollback,
+  and accepted divergent abandonment, with clean foreign jj operation/Git-ref
+  interference and no-interference controls;
+- normal and text-conflict full workflow, no-op, scoped and unscoped stale-parent
+  history, stacked parent/child cross-bundle associations, multi-parent basis
+  collapse, rename, deletion and binary conflicts;
+- real failed ort prediction (invalid configuration), incomplete output sets,
+  wrong labels, unexplained rename residuals, parent pointer mismatch and modified
+  parent evidence; these cannot become accepted mechanics;
+- `a/b`, `a_b`, `a__b` simultaneously conflicted, complete durable payload and
+  source-path associations, empty/substituted payload controls, extra/unassociated
+  artifacts, and unexplained serialized-storage paths;
+- remote snapshots before allocation through terminal (including blocked and
+  unprovenanced outcomes) and separately after rollback; intentional publication
+  to a disposable bare remote fails the same equality oracle.
 
-## Honest coverage limits
+Git storage residuals and raw range rows are preserved, not filtered. Logical
+residuals are decoded only with an exact commit-header/tree/operation proof.
+Every pre/post change is accounted for by stable ID, authored metadata, parent
+edges and per-change ort prediction (including clean virtual merge bases).
+Unexplained correspondence, inherited unresolved conflicts, and ort/jj rename
+mismatches remain blocked. This is mechanical provenance, not semantic resolution.
 
-The helper enforces a **cooperative local protocol**, not a sandbox against an
-arbitrary writer with the same filesystem privileges. Persistent ownership
-survives worker death; a non-cooperating writer can still modify files/metadata,
-which must block currentness/cleanliness checks rather than trigger cleanup.
-There is intentionally no automatic unknown-owner recovery or deletion API.
+## Evidence retention and limits
 
-No live agent invocation tree or RFQ wrapper is exercised: same-operation
-self-dispatch prohibition and native endpoint/subtree completion validation are
-operator obligations, not facts inferred from a helper exit. The helper records
-`topology_validation: operator-owned`, never a fictitious process-tree pass.
-The implementation agent cannot run that agent exercise under its no-delegation
-assignment; the separately blocked RFQ adapter and caller own that follow-up.
+Set `VR_TEST_ARTIFACT_ROOT` to retain raw command receipts and fixture copies.
+Tests execute in system temporary directories and copy their exact bytes out
+before cleanup. `fixture-origin.json` records original paths/test identity;
+retained copies are evidence, never resumable live substrates. Without this
+variable, temporary fixtures are removed on completion.
 
-Mechanical verdict **selection** remains the workflow's existing model-owned
-algebra, not a new algorithm in the helper. Tests supply mechanical labels when
-exercising the ownership/terminal API; they do not certify every conflict verdict
-or semantic resolution. Workflow T1/T3/T4/T6/T10 and T12's scoped path have direct
-fixture coverage; T2 executes text-conflict production but not semantic verdict
-selection. T7 rename, T8 delete, T9 binary, T11 multi-parent collapse, unscoped T12
-verdict classification and a successful divergent-abandon case remain contract
-scenarios, not claimed passing experiments. ACR-260/261 and the prompt-override
-WRITE evals are specifications, not executable suites or agent-tree proof.
+The helper enforces a cooperative Linux/local-filesystem protocol, not a sandbox
+against arbitrary same-user writers. Unexpected mutations must block, not trigger
+automatic cleanup or takeover. There is no unknown-owner recovery/deletion API.
+
+No live agent invocation tree or RFQ adapter is exercised. The selected endpoint
+and caller must establish native same-operation completion separately; a helper
+exit or `topology_validation: operator-owned` is not that evidence. Source/config
+variants outside these fixtures are not claimed tested. Prompt-override WRITE
+evals remain specifications, not agent-tree experiments or semantic review.

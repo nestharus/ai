@@ -300,7 +300,11 @@ Required in addition to `repo_root`, `branch`, `target`:
 - Optional `source` and `parent_bundle` map to workflow `SOURCE` / `PARENT_BUNDLE`.
 
 The internal `tools/verified_rebase.py` helper owns atomic substrate reservation,
-mutation journaling, exact-state fencing and local rollback. Use the helper from
+mutation journaling, command-return operation/effect fencing, injectively mapped
+conflict evidence, source-bound mechanical bundle assembly/validation, and local
+rollback. `vr assemble` produces complete summary/refs/parent associations and
+checks logical conflict decoding plus every pre/post change correspondence;
+`finish` cannot accept a supplied false label or incomplete output set. Use the helper from
 the same authoritative checkout as this operator; pin its path/hash in the
 bundle. Do not reproduce its locks, substitute a PID/age lease, or issue naked
 rebase/abandon/restore commands around it. All diagnostic jj reads use
@@ -530,7 +534,7 @@ git branch -f "$BRANCH" "$SQUASHED"
 # (See ~/ai/workflows/verified-rebase.md for inputs and phases.)
 ```
 
-The workflow handles: fetch, ort prediction, jj rebase, conflict artifacts, residual diffs, verdict, and `rollback.sh`. For each conflicted file, the workflow's `conflict-artifacts/<slug>.conflict` contains jj's first-class conflict representation — consult that instead of re-reading both sides by hand.
+The workflow handles: fetch, ort prediction, jj rebase, conflict artifacts, residual diffs, verdict, and `rollback.sh`. For each conflicted file, the workflow's `conflict-artifacts/<ordinal>.conflict` contains jj's first-class conflict representation — consult that instead of re-reading both sides by hand.
 
 ### Phase 3: Inspect Bundle and Decide
 
@@ -627,5 +631,7 @@ After all suites pass:
 
 ## Stop Conditions
 
-- Return `BLOCKED` if: merge conflicts that need human resolution, `jj op restore` needed
+- Return `BLOCKED` for unprovenanced mechanics or blocked execution/ownership.
+  Captured unresolved conflicts with proven mechanical provenance are
+  `DIRTY-EXPLAINED`, not semantic acceptance; the caller must review or roll back.
 - Return `NEEDS_INPUT` if: unclear which parent to collapse, ambiguous change IDs

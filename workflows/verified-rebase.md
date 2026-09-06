@@ -14,10 +14,15 @@ workflow_dispatch_contract:
   - selected endpoint directly owns all phases; no same-operation redispatch
   - atomic persistent substrate/Git common-dir/jj store reservation survives suspension and interruption
   - unknown ownership, intervening state, or partial records fail closed without cleanup
+  - command-return checkpoints require owned operation lineage and attributable Git effects
+  - conflict artifacts preserve injective source-path associations in conflict-artifacts/index.json
+  - executable source-bound logical residual and complete change correspondence determine mechanical verdicts
+  - complete summary refs parent associations and rollback artifacts are required before terminal publication
   outputs:
   - bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
   - identity-bound result.json with separate mechanical verdict and execution terminal; no push eligibility
   - attempt-specific refs/pre-rebase/<attempt_id> anchor and owner-fenced rollback.sh
+  - complete raw storage residual logical-tree proof correspondence summary and refs artifacts
   non_goals:
   - does not provide a plain rebase fallback
   - does not decide whether the caller should push
@@ -75,7 +80,7 @@ intrinsic_surface_declarations:
       - residual.patch
       - range-diff.txt
       - conflict-artifacts/files.txt
-      - conflict-artifacts/<slug>.conflict
+      - conflict-artifacts/<ordinal>.conflict
       - jj-pre-op-id.txt
       - rollback.sh
       - <planning_dir>/<owner_invocation_id>/<attempt_id>/
@@ -212,25 +217,28 @@ Bundle allocation uses UUIDs, not branch slugs. Preserve the exact branch separa
 
 | File | Producer | Required content |
 |------|----------|------------------|
-| `summary.md` | workflow | Branch, target, all SHAs/oids incl. `POST_CHANGE_ID`, verdict, hunk counts, rename-present flag, `parent-pointer-check` line for stacked, one-liner rollback instruction |
+| `summary.md` | workflow | Branch, target, all SHAs/oids incl. `POST_CHANGE_ID` and logical tree, verdict, hunk counts, rename-present flag, `parent-pointer-check` line for stacked, one-liner rollback instruction |
 | `refs.json` | workflow | `{branch, target, PRE_BASE, PRE_TIP, NEW_TARGET, POST_TIP, POST_CHANGE_ID, PREDICTED_TREE, timestamp, parent_bundle?, verdict}` |
 | `target-delta.patch` (named `main-delta.patch` when `TARGET=origin/main`) | `git diff "$PRE_BASE" "$NEW_TARGET" --find-renames` | What the target introduced during the wait |
 | `branch-intended.patch` | `git diff "$PRE_BASE" "$PRE_TIP" --find-renames` | What the branch intended to change |
 | `branch-actual.patch` | `git diff "$NEW_TARGET" "$POST_TIP" --find-renames` | What the branch changes after rebase |
-| `residual.patch` | `git diff "$PREDICTED_TREE" "$POST_TIP^{tree}" --find-renames` | **Provenance check.** See "Verdict" below. |
+| `residual.patch` | helper: diff predicted tree to proven logical post tree | **Provenance check.** See "Verdict" below. |
 | `merge-tree.out` | `git merge-tree --write-tree --merge-base="$PRE_BASE" "$PRE_TIP" "$NEW_TARGET"` | Prediction stdout. First line is the accepted `PREDICTED_TREE` when the workflow continues; later lines may contain conflict descriptors. |
 | `merge-tree.err` | `git merge-tree --write-tree --merge-base="$PRE_BASE" "$PRE_TIP" "$NEW_TARGET"` | Prediction stderr. |
 | `merge-tree.status` | workflow | Decimal prediction command status, one line. `0` is success, `1` is expected content-conflict status when line 1 of `merge-tree.out` is a valid tree oid, and anything outside `{0, 1}` is `BLOCKED:merge-tree-failed`. |
+| `residual-storage.patch` | helper: full diff predicted tree to Git post tree | Unmodified serialized-storage residual; no excluded paths |
+| `logical-trees.json` / `correspondence.json` / `mechanics.json` | helper | Source-bound decoder, complete change populations, derived decision |
 | `range-diff.txt` | `git range-diff "$PRE_BASE..$PRE_TIP" "$NEW_TARGET..$POST_TIP"` | Per-commit correspondence; catches drops/reorders |
 | `conflict-artifacts/files.txt` | Row-validation adapter over `conflict-artifacts/jj-resolve-list-raw.txt` | Row-validation adapter output. One validated bare conflicted repository path per non-empty line, produced from `conflict-artifacts/jj-resolve-list-raw.txt` per § 6. Empty if no conflicts. |
 | `conflict-artifacts/jj-resolve-list-raw.txt` | `jj resolve --list -r "$POST_CHANGE_ID" --no-pager` | Raw `jj resolve --list -r "$POST_CHANGE_ID" --no-pager` stdout sidecar; preserved for diagnostics. May contain jj's human-rendered `path<TAB>N-sided conflict` rows. NOT consumed by verdict computation, `.conflict` artifact production, or operator inspection prose. |
-| `conflict-artifacts/<slug>.conflict` | `jj file show -r "$POST_CHANGE_ID" "$path"` | jj's first-class conflict representation, per conflicted path |
+| `conflict-artifacts/index.json` | internal helper | Injective source-path to ordinal-artifact association and exact payload SHA-256 |
+| `conflict-artifacts/<ordinal>.conflict` | `jj file show -r "$POST_CHANGE_ID" "$path"` | jj's first-class conflict representation, per conflicted path |
 | `jj-op-log-before.txt` | `jj_read op log --limit 20 --no-pager` pre-rebase | Audit trail |
 | `jj-op-log-after.txt` | `jj_read op log --limit 20 --no-pager` post-rebase | Audit trail |
 | `jj-pre-op-id.txt` | `state.json.pre.JJ_PRE_OP_ID` (captured post-fetch, pre-rebase) | Rollback target |
 | `rollback.sh` | workflow (template below) | Pinned helper/path/owner/attempt invocation, no bare restore |
 | `owner.json` | internal helper | Immutable invocation UUID, attempt UUID, exact branch/target/source, bundle, canonical path + device/inode substrate identities, helper hash and attempt anchor |
-| `state.json` | internal helper | Durable operation checkpoint: full refs, HEAD, jj operation; completed labels and in-flight command intent; pre refs / post-fetch rollback operation |
+| `state.json` | internal helper | Durable operation checkpoint: full refs, HEAD, jj operation; completed labels and in-flight command intent; pre refs / post-fetch rollback operation, pre-rebase cleanup candidate IDs, assembly checkpoint and complete artifact hashes |
 | `result.json` | internal helper | Owner, checkpoint, pre/post identities, mechanical verdict, execution terminal, evidence hashes, no push eligibility, pending caller synchronization; topology validation is operator-owned |
 | `rollback-result.json` | internal helper | Exact restored checkpoint; repeat is validated against current ownership/state, not a flag |
 | `parent-delta.patch` *(stacked only)* | copy of `$PARENT_BUNDLE/branch-actual.patch` | Parent's shift — what the child inherits from its parent's rebase |
@@ -288,7 +296,7 @@ writing to the substrate. Never take over by age or PID.
 vr anchor
 PRE_BASE=$(jq -er .pre.PRE_BASE "$BUNDLE/state.json")
 PRE_TIP=$(jq -er .pre.PRE_TIP "$BUNDLE/state.json")
-jj_read op log --limit 20 > "$BUNDLE/jj-op-log-before.txt"
+# Operation-pinned before/after logs are produced by vr assemble.
 ```
 
 The helper creates `refs/pre-rebase/$ATTEMPT_ID` with an expected-absent CAS.
@@ -350,10 +358,21 @@ vr rebase
 
 The helper executes the existing `jj --ignore-working-copy --config
 'revset-aliases."immutable_heads()"="none()"' rebase -s "$SOURCE" -d "$NEW_TARGET"`
-or `rebase -b "$BRANCH" -d "$NEW_TARGET"` with the frozen inputs and target. A
-completed label cannot run twice. Divergent cleanup is also journaled/fenced;
-it must prove a current surviving revision with the same change ID and must not
-abandon a current or foreign commit. Unprovable cleanup blocks, never falls back
+or `rebase -b "$BRANCH" -d "$NEW_TARGET"` with the frozen inputs and target.
+Every jj mutation is pinned to the prior checkpoint operation and a fresh command
+UUID in operation metadata. At command return, the helper walks only attributable
+single-parent operations back to that checkpoint, then compares all Git refs and
+HEAD against their recorded exports. A clean foreign operation or unexplained ref
+is not adopted as a checkpoint. The same check fences rollback; a failed check
+retains the in-flight intent, raw receipt, observed state and reservation without
+restoring or deleting foreign state. A completed label cannot run twice.
+Divergent cleanup is also journaled/fenced;
+anchor freezes all then-visible versions of the pre-rebase branch change IDs
+in `CLEANUP_CANDIDATES`. Cleanup requires one of those exact commit IDs still
+visible at the checkpoint, a current surviving branch revision with that same
+change ID, and exclusion from the current branch ancestry. It may therefore
+abandon a genuine pre-existing divergent sibling, but not an unrelated change,
+a new version discovered after the freeze, or a current commit. Unprovable cleanup blocks, never falls back
 to a naked command. No push or worktree synchronization runs here.
 
 Stop: `BLOCKED:rebase-failed` (rare; jj accepts conflicts and stores them as first-class tree values).
@@ -363,104 +382,86 @@ Stop: `BLOCKED:rebase-failed` (rare; jj accepts conflicts and stores them as fir
 ```bash
 POST_TIP=$(git rev-parse "$BRANCH")
 POST_CHANGE_ID=$(jj_read log -r "$BRANCH" --no-graph --no-pager --limit 1 --template 'change_id')
-jj_read op log --limit 20 > "$BUNDLE/jj-op-log-after.txt"
+# Operation-pinned before/after logs are produced by vr assemble.
 
-mkdir -p "$BUNDLE/conflict-artifacts"
-# Capture raw jj resolve --list stdout to a diagnostic sidecar first (ACR-260 precedent).
-jj_read resolve --list -r "$POST_CHANGE_ID" \
-  > "$BUNDLE/conflict-artifacts/jj-resolve-list-raw.txt" 2>/dev/null || true
-
-# Row-validation adapter: validate each non-empty raw line and emit only validated bare paths
-# into the canonical conflict-artifacts/files.txt. Reject unsupported rendering rows with a
-# documented BLOCKED token rather than silently truncating.
-: > "$BUNDLE/conflict-artifacts/files.txt"
-while IFS= read -r RAW; do
-  [ -z "$RAW" ] && continue
-  # Strip the first whitespace-delimited field as the candidate path.
-  CAND=${RAW%%[[:space:]]*}
-  # Strict bare-path validation: no whitespace, no shell metacharacters, repository-path-shaped.
-  if ! echo "$CAND" | grep -Eq '^[A-Za-z0-9._/-]+$'; then
-    echo "BLOCKED:unsupported-jj-resolve-list-row: raw='$RAW'; candidate='$CAND'; see $BUNDLE/conflict-artifacts/jj-resolve-list-raw.txt" >&2
-    exit 1
-  fi
-  printf '%s\n' "$CAND" >> "$BUNDLE/conflict-artifacts/files.txt"
-done < "$BUNDLE/conflict-artifacts/jj-resolve-list-raw.txt"
-
-# .conflict artifact production reads only validated paths from canonical files.txt.
-while IFS= read -r P; do
-  [ -z "$P" ] && continue
-  SLUG=$(echo "$P" | tr '/' '__')
-  jj_read file show -r "$POST_CHANGE_ID" "$P" \
-    > "$BUNDLE/conflict-artifacts/${SLUG}.conflict"
-done < "$BUNDLE/conflict-artifacts/files.txt"
+vr capture-conflicts
 ```
 
-Raw jj output is captured first in `conflict-artifacts/jj-resolve-list-raw.txt`, then the row-validation adapter publishes only validated bare paths to canonical `conflict-artifacts/files.txt`. If there are no conflicts, `files.txt` is empty and no `.conflict` files are written. Unsupported rows halt the workflow with `BLOCKED:unsupported-jj-resolve-list-row` rather than publishing truncated or raw display text.
+The helper captures raw stdout, stderr and return code first; a failed command
+never becomes an empty conflict list. The known no-conflict exit is accepted only
+with its exact diagnostic and a pinned `conflict=false` observation. Only complete supported `path N-sided
+conflict` rows become `files.txt`. Duplicate paths and unsupported renderings
+block. Every path receives a distinct ordinal `.conflict` artifact in the
+exclusively created directory. `index.json` binds the exact source path to the
+artifact name and SHA-256. It is an injective per-bundle association, not a lossy
+path slug: `a/b`, `a_b`, and `a__b` all retain separate representations. Partial
+capture is preserved and cannot be silently overwritten on resume.
 
-### 7. Compute diffs
+### 7. Produce diffs and source-bound correspondence
+
+`vr assemble` below computes every patch from the exact frozen pre/post objects.
+`residual-storage.patch` retains the full Git storage residual. `residual.patch`
+compares the ort prediction to the **logical** post tree, not jj's serialized Git
+conflict tree. For conflict commits, the helper verifies the `jj:trees` header,
+every side/base subtree, the root side and exact serialization README against
+all raw tree entries. It then decodes every logical path through operation-pinned
+jj reads and records its path/mode/blob association in `logical-trees.json`.
+Unknown layouts, name collisions or unsupported modes fail closed. No path is
+ignored by prefix, and no conflict is resolved.
+
+`range-diff.txt` is retained unmodified, including drop/add rows when Git cannot
+match a first-class conflict commit. `correspondence.json` accounts for **all**
+old and new commits by stable jj change ID, exact commit IDs, authored metadata,
+parent edges (including redundant merge-edge collapse), and per-change ort
+residuals. Missing/duplicate changes or changed edges remain unexplained. An
+inherited unresolved conflict outside a change's own patch is not evidence for
+that change. Multi-parent changes get per-change ort proof against object-only, cleanly
+merged virtual parent bases as well as the aggregate residual proof. An
+unresolved virtual parent basis is unprovenanced, never a fallback pass;
+Git's omission of merge commits is not permission to drop them from the population.
+
+### 8. Compute mechanical verdict and complete bundle
 
 ```bash
-# target-delta (named main-delta.patch when TARGET is origin/main)
-if [ "$TARGET" = "origin/main" ]; then DELTA=main-delta.patch; else DELTA=target-delta.patch; fi
-git diff "$PRE_BASE" "$NEW_TARGET" --find-renames > "$BUNDLE/$DELTA"
-git diff "$PRE_BASE" "$PRE_TIP"    --find-renames > "$BUNDLE/branch-intended.patch"
-git diff "$NEW_TARGET" "$POST_TIP" --find-renames > "$BUNDLE/branch-actual.patch"
-git diff "$PREDICTED_TREE" "$POST_TIP^{tree}" --find-renames > "$BUNDLE/residual.patch"
-git range-diff "$PRE_BASE..$PRE_TIP" "$NEW_TARGET..$POST_TIP" > "$BUNDLE/range-diff.txt"
+PARENT_ARGS=()
+if [ -n "${PARENT_BUNDLE:-}" ]; then PARENT_ARGS=(--parent-bundle "$PARENT_BUNDLE"); fi
+vr assemble "${PARENT_ARGS[@]}"
 ```
 
-### 8. Compute verdict
+The same checked-in helper implements the gate and summary/refs/rollback
+production, not a model-supplied label:
 
-Mechanical gate — purely syntactic, based on path-set membership and range-diff markers:
+- `DIRTY-UNPROVENANCED` if any logical residual path lacks a conflict association,
+  any change correspondence remains unexplained, or a parent pointer differs.
+- Otherwise `DIRTY-EXPLAINED` when logical residuals or unresolved conflicts exist.
+- Otherwise `CLEAN`.
 
-```
-Let RP = {path : path appears in residual.patch}.
-Let CF = {path : path appears in conflict-artifacts/files.txt}.
-Let DC = {commit : range-diff.txt row prefix is '<' (dropped) or shows unexpected drift without a '=' match}.
+The complete raw residual, range rows, decoder associations, correspondence
+population, and command receipts remain in the bundle. Mechanical provenance
+is not semantic correctness. In particular, propagated unresolved ancestral
+conflicts can block a stale-parent rebase even when its tip's residual is empty.
+A renamed file on which ort and jj disagree remains unprovenanced, not filtered.
 
-Verdict:
-  CLEAN                if RP is empty AND DC is empty
-  DIRTY-EXPLAINED      if RP ⊆ CF     AND DC is empty
-  DIRTY-UNPROVENANCED  if RP ⊄ CF     OR  DC is non-empty
-```
+### 9. Stacked cross-check
 
-`DIRTY-EXPLAINED` proves mechanical provenance: every residual hunk sits in a file that had a conflict. The reviewer still has to judge each resolution's correctness semantically — the gate doesn't claim the resolution was *right*, only that it had a provenance.
-
-`DIRTY-UNPROVENANCED` is the blocking **mechanical** verdict. Execution ownership/cleanliness/currentness can independently block even a `CLEAN` mechanical result. It means either (a) content changed in a file that had no conflict, or (b) a commit was dropped/reordered without explanation. Both require human review.
-
-In the stacked case where `PREDICTED_TREE` collapses (see §3.4 of [the proposal](../.build/VR-01-verified-rebase-proposal.md)), `residual.patch` is often trivially empty — the load for the child's content check is carried by `conflict-artifacts`, `range-diff.txt`, and the parent-pointer invariant (§9 below), not `residual.patch` alone.
-
-### 9. Stacked cross-check (only when `$PARENT_BUNDLE` is set)
-
-```bash
-PARENT_POST_TIP=$(jq -r '.POST_TIP' "$PARENT_BUNDLE/refs.json")
-if [ "$PARENT_POST_TIP" = "$NEW_TARGET" ]; then
-  echo "parent-pointer-check: PASS" >> "$BUNDLE/summary.md.fragment"
-else
-  echo "parent-pointer-check: FAIL (expected $NEW_TARGET got $PARENT_POST_TIP)" >> "$BUNDLE/summary.md.fragment"
-fi
-cp "$PARENT_BUNDLE/branch-actual.patch" "$BUNDLE/parent-delta.patch"
-```
-
-The pointer invariant `parent.POST_TIP == child.NEW_TARGET` is the only cross-bundle invariant. FAIL means the child was rebased onto the wrong commit.
+When `PARENT_BUNDLE` is supplied, assembly checks its terminal/evidence hashes,
+requires parent result and refs to agree, copies exact `branch-actual.patch` bytes
+to `parent-delta.patch`, records the parent result hash, and writes the
+`parent-pointer-check` in both `summary.md.fragment` and `summary.md`.
+`parent.POST_TIP == child.NEW_TARGET` must hold for mechanical acceptance.
+A mismatched pointer produces an unprovenanced blocked result; an incomplete or
+changed parent bundle refuses assembly. No parent files are rewritten.
 
 ### 10. Freeze terminal evidence and release
 
-Assemble `summary.md`, `refs.json`, all patches and diagnostics **before** terminal
-publication. Include exact invocation/attempt/substrate/bundle, pre/post refs and
-operations, mechanical verdict, execution status, and pending sync/review/push
-obligations. Write `rollback.sh` as a pinned invocation of the same helper:
+The preceding assembly produces `summary.md`, `refs.json`, all patches,
+diagnostics and shell-quoted executable `rollback.sh` **before** terminal
+publication. It pins their complete path/hash set into `state.json` along with
+the derived mechanical decision. `finish` refuses missing/changed/added outputs
+and a supplied label that differs from that decision. Incomplete rebase evidence
+cannot become a complete terminal. Preflight-only blocked terminals explicitly
+record `NOT-RUN` and diagnostic summary/refs rather than invented mechanics.
 
-```bash
-#!/bin/bash
-set -euo pipefail
-# Generator substitutes shell-quoted absolute literals, not caller cwd or current pointers:
-exec python3 <pinned-VR_HELPER> rollback --bundle <exact-BUNDLE> \
-  --owner-id <OWNER_ID> --attempt-id <ATTEMPT_ID>
-```
-
-Use a shell-quoting encoder (e.g. `shlex.quote`) for every substituted value,
-then `chmod +x "$BUNDLE/rollback.sh"` before terminal evidence is frozen.
 The helper validates its own hash, owner, attempt, canonical substrate identities,
 all refs and jj operation, clean source, and the exact attempt anchor. Rollback
 reacquires the same resources and refuses any intervening owner **even if that
@@ -481,16 +482,23 @@ report blocked, not release. After evidence is complete and all tool/child
 activity terminal (not a claim that this still-running endpoint has exited):
 
 ```bash
-vr finish --mechanical "$MECHANICAL" --execution "$EXECUTION" --reason "${REASON:-}"
+vr finish
+# For an independently blocked execution with valid assembled mechanics instead:
+# vr finish --execution BLOCKED --reason <actual-reason>
 vr release
 ```
 
-`EXECUTION=COMPLETE` requires a completed rebase and final clean/current state.
+`COMPLETE` requires a completed rebase, a complete unchanged assembled bundle,
+provenanced mechanics and final clean/current state. Default execution for
+`DIRTY-UNPROVENANCED` is `BLOCKED`; explicitly requesting COMPLETE is rejected.
 `EXECUTION=BLOCKED` can retain `MECHANICAL=CLEAN` (for example, unexpected foreign
 files after rebase) but always has `push_eligible=false`. A state/ownership mismatch
 or in-flight command prevents finish/release: write a uniquely named external
 diagnostic, preserve everything, and hand back `BLOCKED:recovery-required`.
-Do not alter canonical evidence after `finish`; `release` checks its hashes.
+Do not alter assembled canonical evidence, including adding files; `finish` and
+`release` check its complete path/hash set. Native runner/topology records that
+continue after assembly stay in separate external owner-qualified evidence, not
+inside this frozen bundle. The caller must join those records separately.
 
 Clean completion marks only this owner's records released; it does not delete
 bundles, anchors, guards, worktrees or substrates. Released records remain as
@@ -538,7 +546,10 @@ Symptoms:
 - `DIRTY-UNPROVENANCED` verdict.
 - `conflict-artifacts/files.txt` concentrates in paths that `target-delta.patch` edits.
 - `range-diff.txt` shows many `<` (left-only) entries with subjects matching commits in `target-delta.patch` — the branch carries near-duplicate copies of the new `TARGET`'s commits.
-- Residual hunk count is misleadingly large because jj wrote first-class conflict trees (`.jjconflict-base-N/`, `.jjconflict-side-N/`) into `POST_TIP^{tree}`, so `residual.patch` includes those entire side trees.
+- Raw storage residual hunk count is misleadingly large because jj wrote first-class
+  conflict trees into `POST_TIP^{tree}`. `residual-storage.patch` retains those entire
+  side trees; `residual.patch` is logical and `correspondence.json` records inherited
+  unresolved ancestral conflicts that the child did not itself introduce.
 
 Recovery:
 
@@ -555,13 +566,13 @@ Runnable helper/procedure fixtures: `python3 -m unittest discover -s evals/verif
 | # | Scenario | Expected verdict / artifacts |
 |---|----------|------------------------------|
 | T1 | Conflict-free rebase; non-overlapping main changes | `CLEAN`. `residual.patch` empty. `range-diff.txt` shows `=` for every branch commit. |
-| T2 | Text conflict on a line both sides edited | `DIRTY-EXPLAINED`. `residual.patch` touches only the conflicted file. `conflict-artifacts/<slug>.conflict` non-empty. |
+| T2 | Text conflict on a line both sides edited | `DIRTY-EXPLAINED`. `residual.patch` touches only the conflicted file. `conflict-artifacts/<ordinal>.conflict` non-empty. |
 | T3 | Stacked parent/child rebase | Two bundles. Bundle B's `summary.md` shows `parent-pointer-check: PASS`. |
 | T4 | `rollback.sh` after a rebase | Branch ref back to `PRE_TIP`. `refs/pre-rebase/<attempt_id>` intact. `rollback-result.json` records the restored operation. Re-running is an owner/currentness-validated no-op. |
 | T5 | Disposable production-shaped branches (never live production in regressions) | Bundles produced; no push; verdicts reported; fenced rollback available. |
 | T6 | No-op rebase (branch already up-to-date with target) | `CLEAN`. `target-delta` empty. `branch-intended` == `branch-actual`. |
 | T7 | Rename conflict (main renames a file the branch edited) | `DIRTY-EXPLAINED` with rename-present flag; OR `DIRTY-UNPROVENANCED` if ort/jj disagree (flagged as rename-detection divergence). |
-| T8 | Delete conflict (main deletes, branch modifies) | `DIRTY-EXPLAINED`. `conflict-artifacts/<slug>.conflict` shows the deletion side. |
+| T8 | Delete conflict (main deletes, branch modifies) | `DIRTY-EXPLAINED`. `conflict-artifacts/<ordinal>.conflict` shows the deletion side. |
 | T9 | Binary conflict | Content-conflict exit with a valid first-line predicted tree (`merge-tree.status=1`) continues into ordinary conflict accounting via `conflict-artifacts/files.txt` and `residual.patch`; real binary/unsupported prediction failure with no valid tree oid or status outside `{0, 1}` stops with `BLOCKED:merge-tree-failed`. |
 | T10 | Rebase leaves unresolved conflicts | `DIRTY-EXPLAINED`. `conflict-artifacts/` has content. Caller resolves or rolls back. |
 | T11 | Multi-parent basis collapse (one parent merged; child rebases onto main directly) | Single bundle at child level; no `parent-pointer-check` (basis was never pushed as target). |
@@ -583,5 +594,6 @@ Runnable helper/procedure fixtures: `python3 -m unittest discover -s evals/verif
 
 Per [`~/ai/conventions/gate-ownership.md`](../conventions/gate-ownership.md):
 
-- Verdict production is **model-owned** (the mechanical gate in phase 8).
+- Mechanical computation and artifact validation are helper-owned; the selected
+  endpoint owns execution/topology disposition, never semantic conflict resolution.
 - Pushing or rolling back is **human-owned**. The workflow never does either.
