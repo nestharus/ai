@@ -104,6 +104,38 @@ class LinearClientError(Exception):
         super().__init__(f"{code}: {message}")
 
 
+def _successful_mutation(
+    result: dict[str, Any], field: str, failure_message: str
+) -> dict[str, Any]:
+    """Accept only an explicit successful acknowledgement after a mutation attempt."""
+    data = result.get("data")
+    payload = data.get(field) if isinstance(data, dict) else None
+    if not isinstance(payload, dict) or type(payload.get("success")) is not bool:
+        raise LinearClientError(
+            "INVALID_RESPONSE",
+            f"Linear mutation requires data.{field}.success as a boolean; outcome not established",
+        )
+    if payload["success"] is False:
+        raise LinearClientError("API_ERROR", failure_message)
+    return payload
+
+
+def _mutation_comment(payload: dict[str, Any], expected_id: str | None = None) -> dict[str, Any]:
+    """Require the note identity needed for successful completion, without an echo rule."""
+    comment = payload.get("comment")
+    if (
+        not isinstance(comment, dict)
+        or not isinstance(comment.get("id"), str)
+        or not comment["id"].strip()
+        or (expected_id is not None and comment["id"] != expected_id)
+    ):
+        raise LinearClientError(
+            "INVALID_RESPONSE",
+            "Linear mutation comment identity is missing, malformed or changed; completion not established",
+        )
+    return comment
+
+
 def _search_issue_nodes(result: dict[str, Any]) -> list[Any]:
     """Require a search collection instead of interpreting unreadable data as empty."""
     data = result.get("data")
@@ -697,9 +729,7 @@ mutation IssueCreate($input: IssueCreateInput!) {
         variables = {"input": input_data}
         result = self._run_graphql(mutation, variables)
 
-        issue_create = result.get("data", {}).get("issueCreate", {})
-        if not issue_create.get("success"):
-            raise LinearClientError("API_ERROR", "Failed to create issue")
+        issue_create = _successful_mutation(result, "issueCreate", "Failed to create issue")
 
         issue = issue_create.get("issue", {})
         return {
@@ -803,11 +833,12 @@ mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
         variables = {"id": issue_id, "input": input_data}
         result = self._run_graphql(mutation, variables)
 
-        issue_update = result.get("data", {}).get("issueUpdate", {})
-        if not issue_update.get("success"):
-            raise LinearClientError("API_ERROR", f"Failed to update issue: {issue_id}")
+        issue_update = _successful_mutation(result, "issueUpdate", f"Failed to update issue: {issue_id}")
 
-        issue = issue_update.get("issue", {})
+        # The acknowledgement establishes success; these echoes are optional.
+        issue = issue_update.get("issue")
+        if not isinstance(issue, dict):
+            issue = {}
         return {
             "id": issue.get("id"),
             "identifier": issue.get("identifier"),
@@ -980,14 +1011,11 @@ mutation CommentCreate($input: CommentCreateInput!) {
         variables = {"input": {"issueId": issue_id, "body": body}}
         result = self._run_graphql(mutation, variables)
 
-        comment_create = result.get("data", {}).get("commentCreate", {})
-        if not (isinstance(comment_create, dict) and comment_create.get("success")):
-            raise LinearClientError(
-                "API_ERROR",
-                f"Failed to create comment on issue: {issue_id}",
-            )
+        comment_create = _successful_mutation(
+            result, "commentCreate", f"Failed to create comment on issue: {issue_id}"
+        )
 
-        comment = comment_create.get("comment", {})
+        comment = _mutation_comment(comment_create)
         user_data = comment.get("user")
         user_info: dict[str, Any] | None = None
         if user_data:
@@ -1586,11 +1614,9 @@ mutation($issueId: String!, $stateId: String!) {
 """
         variables = {"issueId": issue_uuid, "stateId": state_id}
         result = self._run_graphql(mutation, variables)
-        issue_update = result.get("data", {}).get("issueUpdate", {})
-        if not issue_update.get("success"):
-            raise LinearClientError(
-                "API_ERROR", f"Failed to update state for issue: {issue_uuid}"
-            )
+        issue_update = _successful_mutation(
+            result, "issueUpdate", f"Failed to update state for issue: {issue_uuid}"
+        )
         return {"stateName": issue_update.get("issue", {}).get("state", {}).get("name")}
 
     def update_comment(self, comment_id: str, body: str) -> dict[str, Any]:
@@ -1624,14 +1650,11 @@ mutation CommentUpdate($id: String!, $input: CommentUpdateInput!) {
         variables = {"id": comment_id, "input": {"body": body}}
         result = self._run_graphql(mutation, variables)
 
-        comment_update = result.get("data", {}).get("commentUpdate", {})
-        if not (isinstance(comment_update, dict) and comment_update.get("success")):
-            raise LinearClientError(
-                "API_ERROR",
-                f"Failed to update comment: {comment_id}",
-            )
+        comment_update = _successful_mutation(
+            result, "commentUpdate", f"Failed to update comment: {comment_id}"
+        )
 
-        comment = comment_update.get("comment", {})
+        comment = _mutation_comment(comment_update, expected_id=comment_id)
         return {
             "id": comment.get("id"),
             "body": comment.get("body"),
@@ -2119,9 +2142,7 @@ mutation IssueLabelCreate($input: IssueLabelCreateInput!) {
             input_data["description"] = description
 
         result = self._run_graphql(mutation, {"input": input_data})
-        payload = result.get("data", {}).get("issueLabelCreate", {})
-        if not payload.get("success"):
-            raise LinearClientError("API_ERROR", f"Failed to create label: {name}")
+        payload = _successful_mutation(result, "issueLabelCreate", f"Failed to create label: {name}")
         label = payload.get("issueLabel") or {}
         return cast(dict[str, Any], label)
 
