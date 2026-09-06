@@ -8,6 +8,7 @@ and teardown have deadlines (polling here observes fixtures, not agent turns).
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -19,11 +20,13 @@ import socket
 import subprocess
 import sys
 import time
+import uuid
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-GUIDE = Path(os.environ.get("WORKTREE_OPERATOR_SOURCE", ROOT / "agents/worktree-operator.md"))
+# Explicit override is retained for source-intervention runs; evidence must bind it.
+GUIDE = Path(os.environ.get("WORKTREE_OPERATOR_SOURCE", ROOT / "agents/worktree-operator.md")).resolve(strict=True)
 DEADLINE = 12
 
 
@@ -56,9 +59,10 @@ class Barrier:
     def __init__(self, path):
         self.server = socket.socket(socket.AF_UNIX)
         self.server.settimeout(DEADLINE)
-        self.server.bind(str(path))
+        address = "@wt-" + uuid.uuid4().hex
+        self.server.bind("\0" + address[1:])
         self.server.listen()
-        self.path = path
+        self.path = address
         self.connections = []
         self.pidfds = []
 
@@ -99,11 +103,11 @@ while sys.stdin.buffer.read(1) == b"c":
     cancel = subprocess.run(["agent-bash", "cancel", job["handle"]], capture_output=True, text=True)
     print(json.dumps(dict(cancel_rc=cancel.returncode, stderr=cancel.stderr)), flush=True)
 '''
-WORKER = '''import os, pathlib, signal, socket, sys
+WORKER = r'''import os, pathlib, signal, socket, sys
 signal.signal(signal.SIGTERM, signal.SIG_IGN)
 signal.signal(signal.SIGINT, signal.SIG_IGN)
 sock = socket.socket(socket.AF_UNIX)
-sock.connect(sys.argv[1])
+sock.connect("\0" + sys.argv[1][1:])
 sock.sendall(str(os.getpid()).encode())
 action = sock.recv(10)
 if action == b"mutate":
@@ -151,6 +155,22 @@ class Runtime:
         section = self.path / f"section-{index}.sh"
         section.write_text(body)
         env = dict(self.env, section_script=str(section), lock_section_path=str(self.lock_script), **limits)
+        acted = [self.lock_script, self.admission, self.owner_script, self.worker, section,
+                 self.path / "bin/agent-bash", self.path / "bin/agent-bash.toml", self.path / "bin/fixture-helper",
+                 lock_path(self.repo).parent / "config"]
+        acted += [self.path / name for name in ("publication.py", "remove.py", "prepare.sh", "provider.json", "bin/gh")
+                  if (self.path / name).exists()]
+        before = dict(command=[sys.executable, str(self.owner_script), str(self.admission)],
+                      guide=str(GUIDE), guide_sha256=hashlib.sha256(GUIDE.read_bytes()).hexdigest(),
+                      files={str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in acted},
+                      environment={key: value for key, value in env.items()
+                                   if key in ("PATH", "GIT_CONFIG_GLOBAL", "GIT_CONFIG_NOSYSTEM")
+                                   or key not in os.environ or key.startswith(("lock_", "AGENT_BASH_", "OULIPOLY_"))})
+        material = self.path / f"material-{index}"
+        material.mkdir()
+        for number, path in enumerate(acted):
+            shutil.copyfile(path, material / f"{number}-{path.name}")
+        (self.path / f"execution-{index}.json").write_text(json.dumps(before, indent=2))
         owner = subprocess.Popen([sys.executable, str(self.owner_script), str(self.admission)],
                                  env=env, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                                  stderr=subprocess.PIPE, text=True)
@@ -162,6 +182,7 @@ class Runtime:
         assert Path(admission["state_dir"]).is_relative_to(self.path), admission
         assert admission.get("dispatch_state") != "registration-outcome-unknown", admission
         self.handles.append(admission["handle"])
+        (self.path / f"admission-{index}.json").write_text(json.dumps(admission, indent=2))
         meta = json.loads(Path(admission["meta"]).read_text())
         if "--cancel-on-owner-exit" in self.admission.read_text():
             assert admission["delivery_mode"] == "sync"
@@ -180,7 +201,9 @@ class Runtime:
             status = self.cli("status", "--observe-only", "--full", admission["handle"])
             assert not status.startswith("ERROR "), status
             return status if status.startswith("DONE ") else None
-        return until(observed)
+        status = until(observed)
+        (self.path / (admission["handle"] + "." + uuid.uuid4().hex + ".terminal.txt")).write_text(status)
+        return status
 
     def worker_body(self, barrier):
         return f'exec "{sys.executable}" "{self.worker}" "{barrier.path}"\n'
@@ -261,11 +284,11 @@ def test_success_and_mechanical_error_release(runtime, barrier, exit_code):
     acquire_now(lock_path(runtime.repo))
 
 
-@pytest.mark.parametrize("how", ["abort", "SIGINT", "SIGTERM", "SIGKILL", "exit"])
+@pytest.mark.parametrize("how", ["cli-cancel", "SIGINT", "SIGTERM", "SIGKILL", "exit"])
 def test_owner_interruption_retires_term_ignoring_work(runtime, barrier, how):
     owner, job = runtime.start(runtime.worker_body(barrier))
     _, child = barrier.entered()
-    if how == "abort":
+    if how == "cli-cancel":
         owner.stdin.write("c")
         owner.stdin.flush()
         assert select.select([owner.stdout], [], [], DEADLINE)[0]
@@ -334,8 +357,9 @@ if args[:2] == ["repo", "view"]:
     assert args[2] == "fixture/project"
     print(json.dumps(state["repo"]))
 elif args[:2] == ["pr", "list"]:
-    assert args[args.index("--repo") + 1] == "fixture/project"
-    assert args[args.index("--state") + 1] == "open"
+    with open(os.environ["FAKE_PROVIDER"] + ".queries", "a") as output:
+        output.write(json.dumps(args) + "\\n")
+    assert args == state["query"], "candidate query mismatch: " + repr(args)
     print(json.dumps(state["prs"]))
 else:
     raise SystemExit("unexpected provider mutation: " + repr(args))
@@ -355,7 +379,10 @@ class Publication:
         git(self.repo, "worktree", "add", "-b", "topic", str(self.target))
         self.provider_path = self.path / "provider.json"
         self.provider = dict(repo=dict(id="repo-id", nameWithOwner="fixture/project",
-                                      url="https://github.com/fixture/project"), prs=[])
+                                      url="https://github.com/fixture/project"), prs=[],
+                             query=["pr", "list", "--repo", "fixture/project", "--state", "open",
+                                    "--head", "topic", "--base", "main", "--json",
+                                    "url,number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner"])
         self.write_provider()
         gh = self.path / "bin/gh"
         gh.write_text(GH)
@@ -608,3 +635,142 @@ def test_identity_guard_subprocess_retains_exclusion_on_owner_loss(publication, 
     assert "reason=owner-exit" in p.runtime.terminal(job)
     assert not p.effects.exists()
     acquire_now(path)
+
+
+class Removal:
+    def __init__(self, runtime):
+        self.runtime, self.repo, self.path = runtime, runtime.repo, runtime.path
+        (self.repo / "tracked").write_text("retain\n")
+        git(self.repo, "add", "tracked")
+        git(self.repo, "-c", "commit.gpgsign=false", "commit", "-m", "tracked fixture")
+        self.remote = self.path / "remote.git"
+        git(self.path, "init", "--bare", str(self.remote))
+        git(self.repo, "remote", "add", "origin", str(self.remote))
+        git(self.repo, "push", "origin", "main")
+        git(self.repo, "fetch", "origin", "main")
+        self.worktrees = self.path / "worktrees"
+        self.target = self.worktrees / "topic"
+        git(self.repo, "worktree", "add", "-b", "topic", str(self.target))
+        self.identity_script = self.path / "remove.py"
+        self.identity_script.write_text(block("worktree-remove-identity-v1"))
+        runtime.env.update(remove_identity_script=str(self.identity_script),
+                           worktrees_root=str(self.worktrees), name="topic",
+                           branch_name="topic", base_branch="main")
+        self.prepare_script = self.path / "prepare.sh"
+        self.prepare_script.write_text(block("worktree-remove-prepare-v1") +
+                                      "python3 -c 'import json,os; print(json.dumps({k: os.environ[k] for k in [\"remove_identity\", \"worktree_path\"]}))'\n")
+
+    def prepare(self):
+        record = self.path / ("prepare-" + uuid.uuid4().hex)
+        before = dict(command=["bash", "-euo", "pipefail", str(self.prepare_script)],
+                      files={str(p): hashlib.sha256(p.read_bytes()).hexdigest()
+                             for p in (self.prepare_script, self.identity_script, lock_path(self.repo).parent / "config")})
+        record.with_suffix(".before.json").write_text(json.dumps(before, indent=2))
+        result = run("bash", "-euo", "pipefail", str(self.prepare_script), env=self.runtime.env)
+        record.with_suffix(".result.json").write_text(
+            json.dumps(dict(rc=result.returncode, stdout=result.stdout, stderr=result.stderr)))
+        if result.returncode == 0:
+            self.runtime.env.update(json.loads(result.stdout))
+        return result
+
+    def remove(self):
+        _, job = self.runtime.start(block("worktree-remove-section-v1"))
+        return self.runtime.terminal(job)
+
+    def state(self):
+        common = lock_path(self.repo).parent
+        return dict(refs=git(self.repo, "show-ref"), fetch_head=(common / "FETCH_HEAD").read_bytes(),
+                    registration=git(self.repo, "worktree", "list", "--porcelain", "-z"),
+                    head=git(self.target, "rev-parse", "HEAD"),
+                    status=git(self.target, "--no-optional-locks", "status", "--porcelain=v1", "-z"),
+                    index=Path(git(self.target, "rev-parse", "--git-path", "index")).read_bytes())
+
+    def advance_remote(self):
+        git(self.repo, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "new base")
+        git(self.repo, "push", str(self.remote), "main")
+        assert git(self.remote, "rev-parse", "main") != git(self.repo, "rev-parse", "refs/remotes/origin/main")
+
+
+@pytest.fixture
+def removal(runtime):
+    return Removal(runtime)
+
+
+def test_remove_acquisition_timeout_never_fetches_or_mutates(removal):
+    r = removal
+    r.advance_remote()
+    # A stat-stale but content-clean tracked file must not refresh the index pre-lock.
+    tracked = r.target / "tracked"
+    stamp = tracked.stat().st_mtime_ns + 2_000_000_000
+    os.utime(tracked, ns=(stamp, stamp))
+    before = r.state()
+    path = lock_path(r.repo)
+    with path.open("a") as holder:
+        fcntl.flock(holder, fcntl.LOCK_EX)
+        assert r.prepare().returncode == 0
+        start = time.monotonic()
+        assert "rc=75 " in r.remove()
+        assert time.monotonic() - start < 5
+        assert r.state() == before
+    acquire_now(path)
+    assert r.target.is_dir()
+    assert r.state() == before
+
+
+def test_remove_fetches_fresh_base_and_verifies_both_postconditions(removal):
+    r = removal
+    r.advance_remote()
+    head = git(r.target, "rev-parse", "HEAD")
+    assert r.prepare().returncode == 0
+    assert "rc=0 " in r.remove()
+    assert not r.target.exists()
+    assert str(r.target) not in git(r.repo, "worktree", "list", "--porcelain")
+    assert git(r.repo, "rev-parse", "refs/remotes/origin/main") == git(r.remote, "rev-parse", "main")
+    assert git(r.repo, "rev-parse", "refs/heads/topic") == head
+    acquire_now(lock_path(r.repo))
+
+
+@pytest.mark.parametrize("change", ["dirty", "head", "branch", "registration", "missing-registration"])
+def test_remove_identity_change_refuses_removal(removal, change):
+    r = removal
+    assert r.prepare().returncode == 0
+    change_identity(r, change)
+    assert "rc=65 " in r.remove()
+    assert (r.target if change != "missing-registration" else r.worktrees / "moved").exists()
+    acquire_now(lock_path(r.repo))
+
+
+def test_remove_dirty_preparation_cannot_admit(removal):
+    r = removal
+    (r.target / "untracked").write_text("retain")
+    before = r.state()
+    result = r.prepare()
+    assert result.returncode == 65
+    assert "dirty-worktree" in result.stderr
+    assert not r.runtime.handles
+    assert r.state() == before
+
+
+@pytest.mark.parametrize("field", ["repo", "state", "head", "base", "json"])
+def test_provider_oracle_rejects_wrong_candidate_query(publication, field):
+    p = publication
+    p.capture()
+    p.provider["prs"] = [p.exact_pr()]
+    p.write_provider()
+    before = p.snapshot.read_bytes()
+    old = {"repo": '"--repo", identity["repo_slug"]',
+           "state": '"--state", "open"', "head": '"--head", identity["branch"]',
+           "base": '"--base", identity["base_branch"]', "json": '"--json", fields'}[field]
+    new = '"--' + field + '", "unrelated"'
+    original = p.guard.read_text()
+    assert original.count(old) == 1
+    p.guard.write_text(original.replace(old, new))
+    assert "rc=76 " in p.publish()
+    assert not p.effects.exists()
+    assert p.snapshot.read_bytes() == before
+    queries = [json.loads(line) for line in Path(str(p.provider_path) + ".queries").read_text().splitlines()]
+    assert queries[0] == p.provider["query"]
+    wrong = p.provider["query"].copy()
+    wrong[wrong.index("--" + field) + 1] = "unrelated"
+    assert queries == [p.provider["query"], wrong]
+    acquire_now(lock_path(p.repo))

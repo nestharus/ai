@@ -39,7 +39,7 @@ inputs:
   type: string
   required: false
   default_source: base
-  description: Existing safe short branch required for create, remove, bulk-cleanup, and open-pr; resolved through the freshly fetched remote-tracking ref to an exact commit.
+  description: Existing safe short branch required for create, remove, bulk-cleanup, and open-pr; resolved through the freshly fetched remote-tracking ref to an exact commit inside the bounded mutation section.
 - name: branch_policy
   type: string
   required: false

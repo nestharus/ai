@@ -43,7 +43,7 @@ inputs:
     type: string
     required: false
     default_source: base
-    description: "Existing safe short branch required for create, remove, bulk-cleanup, and open-pr; resolved through the freshly fetched remote-tracking ref to an exact commit."
+    description: "Existing safe short branch required for create, remove, bulk-cleanup, and open-pr; resolved through the freshly fetched remote-tracking ref to an exact commit inside the bounded mutation section."
   - name: branch_policy
     type: string
     required: false
@@ -311,13 +311,94 @@ Run sync only when the caller explicitly selected `task=sync`. Use the bounded s
 
 ## Procedure: Remove Worktree
 
-Resolve the exact registered target and record its canonical path, checked-out branch, and head SHA. Fetch the validated `base_branch`, set `base_ref` to its exact remote-tracking ref, and resolve `base_sha` from that ref before removal. Acquire the same exclusive advisory mutation lock under the canonical Git common directory used by `sync`. While holding it, re-read the exact registration and require its canonical path, branch, head SHA, base identity, and empty `git status --porcelain` to match the recorded identity. Dirty or changed `remove` requests always return `BLOCKED`, and this operator has no force-removal input. Hold the lock through the removal and both post-removal checks. For the normal path:
+Resolve the exact registered target and record its canonical path, checked-out branch, head SHA, registration, and cleanliness using the read-only identity block below. Validate branch policy before this capture. **Acquire the canonical bounded mutation section before any fetch or base resolution.** Fetch and all subsequent checks/removal run inside that one owner-coupled section, never in pre-acquisition preparation. Acquisition timeout therefore changes neither refs nor `FETCH_HEAD` and does not remove the target.
 
-```bash
-git -C "$repo_root" worktree remove "$worktree_path"
+While holding the lock, require the target identity to remain equal to the recorded identity, fetch the validated `base_branch`, set `base_ref` to its exact remote-tracking ref, and resolve `base_sha`. Re-read the target identity and base ref immediately before removal. Dirty or changed `remove` requests always return `BLOCKED`, and this operator has no force-removal input. Hold the lock through the removal and both post-removal checks; retain the pre-removal identity and fetched base branch/SHA for the result.
+
+Save this read-only block as attempt-private `remove-identity.py`. It checks exact registration and filesystem state; `present` captures or rechecks the target, and `absent` verifies both postconditions. Nonzero blocks the task. It disables optional Git index writes during read-only cleanliness checks and must preserve the inherited exclusion descriptor in section subprocesses.
+
+```python
+# worktree-remove-identity-v1
+import json
+import pathlib
+import re
+import subprocess
+import sys
+
+
+def command(*args):
+    return subprocess.check_output(args, text=True, close_fds=False).rstrip("\n")
+
+
+def require(condition, reason):
+    if not condition:
+        raise ValueError(reason)
+
+
+def main():
+    mode, repo_arg, root_arg, name, branch = sys.argv[1:]
+    require(mode in ("present", "absent"), "invalid-remove-mode")
+    require(re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name), "unsafe-name")
+    repo = pathlib.Path(repo_arg).resolve(strict=True)
+    root = pathlib.Path(root_arg).resolve(strict=True)
+    target = (root / name).resolve()
+    require(target.parent == root and target != repo, "unsafe-worktree-target")
+    command("git", "check-ref-format", "--branch", branch)
+    records = command("git", "-C", str(repo), "worktree", "list", "--porcelain", "-z").split("\0\0")
+    rows = [dict(field.split(" ", 1) if " " in field else (field, "")
+                 for field in record.split("\0") if field) for record in records if record]
+    matches = [row for row in rows if pathlib.Path(row["worktree"]).resolve() == target]
+    if mode == "absent":
+        require(not target.exists() and not target.is_symlink() and not matches, "remove-postcondition-unverified")
+        return
+    require(len(matches) == 1, "stale-remove-worktree-identity")
+    common = command("git", "-C", str(repo), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    target_common = command("git", "-C", str(target), "rev-parse", "--path-format=absolute", "--git-common-dir")
+    require(pathlib.Path(common).resolve() == pathlib.Path(target_common).resolve(), "stale-remove-worktree-identity")
+    head_ref = "refs/heads/" + branch
+    require(command("git", "-C", str(target), "symbolic-ref", "--quiet", "HEAD") == head_ref, "stale-remove-worktree-identity")
+    head = command("git", "-C", str(target), "rev-parse", "--verify", "HEAD^{commit}")
+    require(matches[0].get("branch") == head_ref and matches[0].get("HEAD") == head, "stale-remove-worktree-identity")
+    require(command("git", "--no-optional-locks", "-C", str(target), "status", "--porcelain=v1", "-z") == "", "dirty-worktree")
+    print(json.dumps(dict(worktree_path=str(target), branch=branch, head_sha=head,
+                          clean=True, registration=matches[0], common_dir=str(pathlib.Path(common).resolve())), sort_keys=True))
+
+
+try:
+    main()
+except (ValueError, OSError, subprocess.CalledProcessError) as error:
+    print("BLOCKED:" + str(error), file=sys.stderr)
+    sys.exit(1)
 ```
 
-Verify both that the filesystem path is absent and that no exact canonical path record remains in `git -C "$repo_root" worktree list --porcelain`; only then return the pre-removal identity with `removed: true`.
+Run this preparation once, read-only, before admission. Preserve these exact arguments and `remove_identity` for the immutable section script; do not recapture to fit drift. All snippets use the canonical validated `worktree_path` derived from the identity, not a caller-supplied mutation path.
+
+```bash
+# worktree-remove-prepare-v1
+git check-ref-format --branch "$base_branch" >/dev/null || exit 65
+remove_identity=$(python3 "$remove_identity_script" present "$repo_root" "$worktrees_root" "$name" "$branch_name") || exit 65
+worktree_path=$(printf '%s' "$remove_identity" | python3 -c 'import json,sys; print(json.load(sys.stdin)["worktree_path"])') || exit 65
+export remove_identity worktree_path
+```
+
+The **complete** mechanical `section_script` is this block. Admit it only through the canonical lock section and exact-owner synchronous admission above. No fetch runs until acquisition succeeds. Nonzero is terminal non-success, subject to owned-tree retirement.
+
+```bash
+# worktree-remove-section-v1
+current_identity=$(python3 "$remove_identity_script" present "$repo_root" "$worktrees_root" "$name" "$branch_name") || exit 65
+[[ "$current_identity" == "$remove_identity" ]] || { echo 'BLOCKED:stale-remove-worktree-identity' >&2; exit 65; }
+base_ref="refs/remotes/origin/$base_branch"
+git -C "$repo_root" fetch --no-tags origin "+refs/heads/$base_branch:$base_ref"
+base_sha=$(git -C "$repo_root" rev-parse --verify "$base_ref^{commit}")
+current_identity=$(python3 "$remove_identity_script" present "$repo_root" "$worktrees_root" "$name" "$branch_name") || exit 65
+[[ "$current_identity" == "$remove_identity" ]] || { echo 'BLOCKED:stale-remove-worktree-identity' >&2; exit 65; }
+[[ "$(git -C "$repo_root" rev-parse --verify "$base_ref^{commit}")" == "$base_sha" ]] || exit 65
+git -C "$repo_root" worktree remove "$worktree_path"
+python3 "$remove_identity_script" absent "$repo_root" "$worktrees_root" "$name" "$branch_name"
+printf '%s\n%s\n%s\n' "$remove_identity" "$base_branch" "$base_sha"
+```
+
+Verify both that the filesystem path is absent and that no exact canonical path record remains in `git -C "$repo_root" worktree list --porcelain`; only then return the pre-removal identity with `removed: true`, after owned-tree retirement.
 
 ## Procedure: Bulk Cleanup Merged Worktrees
 
