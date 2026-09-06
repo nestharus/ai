@@ -38,6 +38,33 @@ inputs:
   required: false
   default_source: caller
   description: branch policy
+- name: planning_dir
+  type: path
+  required: false
+  default_source: caller
+  description: 'Required for every verified rebase: existing external planning root; never inside a checkout or
+    substrate.'
+- name: owner_invocation_id
+  type: string
+  required: false
+  default_source: caller
+  description: 'Required for every verified rebase: exact selected endpoint runner invocation UUID; retained across
+    suspension.'
+- name: attempt_id
+  type: string
+  required: false
+  default_source: caller
+  description: 'Required for every verified rebase: fresh UUID, never a branch slug, timestamp, PID, or reused attempt.'
+- name: source
+  type: string
+  required: false
+  default_source: caller
+  description: Optional verified-rebase SOURCE revision for scoped rebases.
+- name: parent_bundle
+  type: path
+  required: false
+  default_source: caller
+  description: Optional exact external parent bundle for stacked verified rebases.
 defaults:
 - name: worktrees_root
   value: ${repo_root}/worktrees
@@ -45,7 +72,8 @@ defaults:
 secrets: []
 outputs:
 - task: rebase
-  success_shape: Task-specific stdout or durable artifact paths named by the procedure.
+  success_shape: Exact owner/attempt/substrate/bundle, pre/post refs and jj operations, mechanical verdict and execution
+    terminal; no push authority. All same-operation activity must finish before owner-fenced release; caller joins native endpoint terminal readback.
   wrote_lines: []
 - task: squash
   success_shape: Task-specific stdout or durable artifact paths named by the procedure.
@@ -102,6 +130,11 @@ may_direct:
 - jj-status-read
 - jj-log-read
 - jj-file-show
+- selected-endpoint-full-verified-rebase
+- verified-rebase-reservation-and-fenced-rollback
 forbidden_direct:
 - caller-prescribed-rebase-mechanics
 - plain-rebase-without-verified-rebase-bundle
+- same-operation-self-redispatch
+- in-checkout-rebase-evidence
+- unowned-substrate-reuse-or-cleanup

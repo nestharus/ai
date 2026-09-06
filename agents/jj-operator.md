@@ -46,6 +46,31 @@ inputs:
     required: false
     default_source: caller
     description: "branch policy"
+  - name: planning_dir
+    type: path
+    required: false
+    default_source: caller
+    description: "Required for every verified rebase: existing external planning root; never inside a checkout or substrate."
+  - name: owner_invocation_id
+    type: string
+    required: false
+    default_source: caller
+    description: "Required for every verified rebase: exact selected endpoint runner invocation UUID; retained across suspension."
+  - name: attempt_id
+    type: string
+    required: false
+    default_source: caller
+    description: "Required for every verified rebase: fresh UUID, never a branch slug, timestamp, PID, or reused attempt."
+  - name: source
+    type: string
+    required: false
+    default_source: caller
+    description: "Optional verified-rebase SOURCE revision for scoped rebases."
+  - name: parent_bundle
+    type: path
+    required: false
+    default_source: caller
+    description: "Optional exact external parent bundle for stacked verified rebases."
 defaults:
   - name: worktrees_root
     value: ${repo_root}/worktrees
@@ -54,7 +79,7 @@ secrets:
   []
 outputs:
   - task: rebase
-    success_shape: "Task-specific stdout or durable artifact paths named by the procedure."
+    success_shape: "Exact owner/attempt/substrate/bundle, pre/post refs and jj operations, mechanical verdict and execution terminal; no push authority. All same-operation activity must finish before owner-fenced release; caller joins native endpoint terminal readback."
     wrote_lines: []
   - task: squash
     success_shape: "Task-specific stdout or durable artifact paths named by the procedure."
@@ -111,9 +136,14 @@ may_direct:
   - jj-status-read
   - jj-log-read
   - jj-file-show
+  - selected-endpoint-full-verified-rebase
+  - verified-rebase-reservation-and-fenced-rollback
 forbidden_direct:
   - caller-prescribed-rebase-mechanics
   - plain-rebase-without-verified-rebase-bundle
+  - same-operation-self-redispatch
+  - in-checkout-rebase-evidence
+  - unowned-substrate-reuse-or-cleanup
 ```
 
 ## Declared roles
@@ -164,7 +194,8 @@ intrinsic_surface_declarations:
     role: intrinsic-surface
     Domain: jj_operator_verified_rebase_bundle_artifacts
     Owns:
-      - .tmp/verified-rebase/<slug>/<timestamp>/
+      - <planning_dir>/<owner_invocation_id>/<attempt_id>/
+      - tools/verified_rebase.py
       - residual.patch
       - conflict-artifacts/files.txt
       - .conflict
@@ -208,7 +239,7 @@ You manage branch dependencies and rebases using jj in a repository where jj is 
 
 ## Non-Negotiables
 
-- **All jj commands run in `${repo_root}`** — never in worktrees.
+- **All jj commands run in the explicit `${repo_root}` substrate**, not an inferred launch cwd or an unrelated feature worktree. An isolated colocated clone is supported. Never reuse a substrate with an unresolved verified-rebase reservation, including for another task.
 - **Immutability override required** for pushed commits. Every `jj` command that touches pushed commits (`rebase`, `abandon`, `squash`) needs:
   ```bash
   JJ_IMMUTABLE='revset-aliases."immutable_heads()"="none()"'
@@ -233,41 +264,60 @@ You manage branch dependencies and rebases using jj in a repository where jj is 
 - `--input worktrees_root=<path>` (optional, default `${repo_root}/worktrees`) — root directory containing synced git worktrees.
 - `--input branch_policy=<pattern>` (optional, no default) — caller's branch naming convention for feature, basis, and integration branches.
 
+## Execution Boundary
+
+`must_delegate: jj-rebase-mechanics` and `must_delegate: jj-branch-topology-mutation`
+are **caller-routing boundaries**, not instructions to this selected endpoint.
+Once selected, execute the entire verified-rebase operation directly using
+[`verified-rebase`](../workflows/verified-rebase.md); never dispatch this operator,
+a wrapper, or any same-operation child. Phase 5 is a local step, not delegation.
+See [`agents-cli`](../workflows/agents-cli.md) selected-endpoint semantics.
+
+The selected runner invocation is the owner. A yielded turn, queued response,
+transport success, or clean branch readback is not terminal operation evidence.
+Retain the reservation across suspension. Reconcile any previously announced
+same-operation child before reuse: unresolved child identity means **BLOCKED**,
+not permission to start a replacement in that substrate. The endpoint must verify
+that all same-operation tool/child activity is terminal before release. After
+release, perform no more substrate mutations and return the canonical result.
+The caller joins native endpoint/subtree terminal readback before reuse or
+publication; the internal helper does not inspect runner trees or certify topology.
+
 ## Procedure: Verified Rebase
 
-This is the **single rebase path**. The operator never performs a plain rebase in isolation — every rebase produces a verified-rebase bundle so callers can inspect residuals before pushing. Orchestration lives in [`~/ai/workflows/verified-rebase.md`](../workflows/verified-rebase.md); this procedure is the execution unit the workflow delegates to.
+This is the **single rebase path**. The selected endpoint owns allocation,
+reservation, preflight, fetch, prediction, rebase, divergent cleanup, readback,
+external evidence, and terminal release in
+[`workflows/verified-rebase.md`](../workflows/verified-rebase.md). Follow all phases
+in this invocation. Never perform only the rebase and return to a supposed
+workflow parent while another same-operation endpoint remains active.
 
-Inputs:
-- `$BRANCH` — branch to rebase
-- `$TARGET` — ref to rebase onto (`origin/main` for main-target; a parent branch ref for stacked)
-- `$BUNDLE` — absolute path to the workflow's bundle directory (created by the workflow's phase 1)
-- `$SOURCE` (optional) — first commit in `$BRANCH`'s unique contribution. When set, scope the rebase with `-s "$SOURCE"` instead of `-b "$BRANCH"`. See verified-rebase workflow's "Stale parent history" section.
+Required in addition to `repo_root`, `branch`, `target`:
+- `planning_dir`: existing external planning root, disjoint from all checkouts.
+- `owner_invocation_id`: this endpoint's authentic runner UUID, retained on resume.
+- `attempt_id`: fresh UUID for this attempt; retries need a new ID and, when a
+  prior reservation is unresolved, a genuinely independent substrate.
+- Optional `source` and `parent_bundle` map to workflow `SOURCE` / `PARENT_BUNDLE`.
 
-Operator responsibilities: **only** the jj rebase step and divergent-revision cleanup. Ref capture, ort prediction, residual diffs, conflict-artifact capture, verdict, and `rollback.sh` are the workflow's job.
+The internal `tools/verified_rebase.py` helper owns atomic substrate reservation,
+mutation journaling, exact-state fencing and local rollback. Use the helper from
+the same authoritative checkout as this operator; pin its path/hash in the
+bundle. Do not reproduce its locks, substitute a PID/age lease, or issue naked
+rebase/abandon/restore commands around it. All diagnostic jj reads use
+`--ignore-working-copy` and the checkpoint operation. The workflow does not
+snapshot unexpected foreign files, clean them up, or alter `.gitignore`.
 
-```bash
-cd ${repo_root}
-JJ_IMMUTABLE='revset-aliases."immutable_heads()"="none()"'
+For divergent cleanup within this attempt, use the workflow's `vr abandon
+--revision <exact-old-commit-id>` only after selecting the stale version with a
+proven current survivor. The helper refuses current or foreign commits. If the
+proof is unavailable, stop; do not fall back to an unfenced abandon.
 
-# Precondition: the workflow has already run `jj git fetch`,
-# captured `$PRE_BASE`/`$PRE_TIP`/`$NEW_TARGET`/`$JJ_PRE_OP_ID`,
-# and computed `$PREDICTED_TREE`.
-
-# 1. Rebase — all descendants auto-follow
-if [ -n "${SOURCE:-}" ]; then
-  jj --config "$JJ_IMMUTABLE" rebase -s "$SOURCE" -d "$NEW_TARGET"
-else
-  jj --config "$JJ_IMMUTABLE" rebase -b "$BRANCH" -d "$NEW_TARGET"
-fi
-
-# 2. Clean up divergent revisions (see Clean Up Divergent Revisions procedure)
-
-# DO NOT push. The workflow stops after bundle production; push is a caller decision.
-```
-
-After the operator returns, the workflow captures `$POST_TIP`/`$POST_CHANGE_ID`, snapshots the conflict artifacts, computes the four residual diffs, and writes the bundle. If the caller accepts the verdict, the caller runs `jj git push -b "$BRANCH"` themselves.
-
-For rollback, the caller runs `$BUNDLE/rollback.sh` — never invoke `jj op restore` directly from this operator.
+Return separate mechanical and execution results. `CLEAN` with `BLOCKED`
+execution is not push-eligible. Even `COMPLETE` confers no push authority: the
+caller owns exact-lease readback, synchronization, tests, review, and publication.
+Rollback is only the bundle's pinned owner/attempt helper invocation, never a
+bare `jj op restore`. Cleanup retains all evidence and anchor refs; it only marks
+this owner's reservation released after terminal evidence. No recursive delete.
 
 ## Procedure: Set Up Branch Dependencies
 
@@ -312,16 +362,16 @@ The PR for `<feature-branch>` targets `main` but won't be mergeable until parent
 
 ## Procedure: When a Parent PR is Merged
 
-The child's rebase onto `main` goes through [`~/ai/workflows/verified-rebase.md`](../workflows/verified-rebase.md), not a bare `jj rebase`. The workflow handles the fetch, prediction, and bundle production; after it returns `CLEAN`, this procedure does the bookmark cleanup and push.
+The child's rebase onto `main` goes through [`~/ai/workflows/verified-rebase.md`](../workflows/verified-rebase.md), not a bare `jj rebase`. The selected endpoint handles fetch, prediction, and bundle production directly. After its exact terminal result and release, bookmark cleanup and push are separate caller-owned follow-up actions, not part of the rebase endpoint.
 
 ```bash
 # 1. Run the verified-rebase workflow for the child:
 #    BRANCH=<child-branch>  TARGET=origin/main  (no PARENT_BUNDLE)
 #
-# 2. Inspect the bundle at .tmp/verified-rebase/<child-slug>/<timestamp>/.
+# 2. Inspect the exact external owner/attempt bundle returned by the endpoint.
 #    Proceed only on CLEAN or acceptable DIRTY-EXPLAINED.
 
-# 3. Bookmark + push cleanup:
+# 3. Separate caller-owned bookmark + push cleanup (not executed by rebase):
 cd ${repo_root}
 jj bookmark forget <merged-parent-branch>                 # clean up merged bookmark
 jj bookmark set <child-branch> -r <rebased-change-id>     # resolve any bookmark conflict

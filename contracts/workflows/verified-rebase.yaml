@@ -5,14 +5,18 @@ orchestrator: jj-operator
 inputs:
 - BRANCH and TARGET refs for the rebase
 - optional SOURCE and PARENT_BUNDLE for scoped or stacked rebases
+- repo_root, external planning_dir, selected endpoint owner_invocation_id, and fresh attempt_id UUID
 expectations:
 - produces a deterministic bundle for rebase review
 - computes mechanical provenance from predicted tree, actual tree, conflicts, and range-diff output
 - does not push and does not resolve conflicts
+- selected endpoint directly owns all phases; no same-operation redispatch
+- atomic persistent substrate/Git common-dir/jj store reservation survives suspension and interruption
+- unknown ownership, intervening state, or partial records fail closed without cleanup
 outputs:
-- bundle under .tmp/verified-rebase/<branch-slug>/<timestamp>/
-- stdout verdict CLEAN, DIRTY-EXPLAINED, DIRTY-UNPROVENANCED, or BLOCKED
-- local refs/pre-rebase/<branch> rollback anchor and rollback.sh helper
+- bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
+- identity-bound result.json with separate mechanical verdict and execution terminal; no push eligibility
+- attempt-specific refs/pre-rebase/<attempt_id> anchor and owner-fenced rollback.sh
 non_goals:
 - does not provide a plain rebase fallback
 - does not decide whether the caller should push

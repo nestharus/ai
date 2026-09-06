@@ -2,22 +2,26 @@
 workflow:
   id: verified-rebase
 workflow_dispatch_contract:
-  orchestrator: "jj-operator"
+  orchestrator: jj-operator
   inputs:
-    - "BRANCH and TARGET refs for the rebase"
-    - "optional SOURCE and PARENT_BUNDLE for scoped or stacked rebases"
+  - BRANCH and TARGET refs for the rebase
+  - optional SOURCE and PARENT_BUNDLE for scoped or stacked rebases
+  - repo_root, external planning_dir, selected endpoint owner_invocation_id, and fresh attempt_id UUID
   expectations:
-    - "produces a deterministic bundle for rebase review"
-    - "computes mechanical provenance from predicted tree, actual tree, conflicts, and range-diff output"
-    - "does not push and does not resolve conflicts"
+  - produces a deterministic bundle for rebase review
+  - computes mechanical provenance from predicted tree, actual tree, conflicts, and range-diff output
+  - does not push and does not resolve conflicts
+  - selected endpoint directly owns all phases; no same-operation redispatch
+  - atomic persistent substrate/Git common-dir/jj store reservation survives suspension and interruption
+  - unknown ownership, intervening state, or partial records fail closed without cleanup
   outputs:
-    - "bundle under .tmp/verified-rebase/<branch-slug>/<timestamp>/"
-    - "stdout verdict CLEAN, DIRTY-EXPLAINED, DIRTY-UNPROVENANCED, or BLOCKED"
-    - "local refs/pre-rebase/<branch> rollback anchor and rollback.sh helper"
+  - bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
+  - identity-bound result.json with separate mechanical verdict and execution terminal; no push eligibility
+  - attempt-specific refs/pre-rebase/<attempt_id> anchor and owner-fenced rollback.sh
   non_goals:
-    - "does not provide a plain rebase fallback"
-    - "does not decide whether the caller should push"
-    - "does not judge semantic correctness of conflict resolutions"
+  - does not provide a plain rebase fallback
+  - does not decide whether the caller should push
+  - does not judge semantic correctness of conflict resolutions
 ---
 # Verified Rebase
 
@@ -25,7 +29,7 @@ workflow_dispatch_contract:
 
 `orchestration`, `validator`, `parser`, `mapper`, `formatter`.
 
-This file-local declaration is explicit per `~/ai/conventions/code-quality.md` § Declared roles. `orchestration` covers the ordered verified-rebase phases and delegation to `jj-operator`. `validator` covers preflight checks, stop conditions, mechanical verdict production, rollback preconditions, and gate ownership. `parser` covers jj/git command output, patch path sets, `refs.json`, `range-diff.txt`, conflict artifact records, and parent-bundle inputs. `mapper` covers ref-to-artifact, conflict-path-to-conflict-file, residual-path-to-conflict-path, and parent-bundle relationships. `formatter` covers bundle files, summary output, stdout verdicts, and rollback helper text.
+This file-local declaration is explicit per `~/ai/conventions/code-quality.md` § Declared roles. `orchestration` covers the ordered verified-rebase phases and direct execution by the selected `jj-operator` endpoint. `validator` covers preflight checks, stop conditions, mechanical verdict production, rollback preconditions, and gate ownership. `parser` covers jj/git command output, patch path sets, `refs.json`, `range-diff.txt`, conflict artifact records, and parent-bundle inputs. `mapper` covers ref-to-artifact, conflict-path-to-conflict-file, residual-path-to-conflict-path, and parent-bundle relationships. `formatter` covers bundle files, summary output, stdout verdicts, and rollback helper text.
 
 ## Intrinsic-surface declarations
 
@@ -57,7 +61,7 @@ intrinsic_surface_declarations:
       - git range-diff
       - git log
       - git push --force-with-lease
-      - refs/pre-rebase/<branch>
+      - refs/pre-rebase/<attempt_id>
   - component: workflows/verified-rebase.md
     role: intrinsic-surface
     Domain: verified_rebase_bundle_artifact_contract
@@ -74,7 +78,7 @@ intrinsic_surface_declarations:
       - conflict-artifacts/<slug>.conflict
       - jj-pre-op-id.txt
       - rollback.sh
-      - .tmp/verified-rebase/<branch-slug>/<ISO-timestamp>/
+      - <planning_dir>/<owner_invocation_id>/<attempt_id>/
       - merge-tree.out
       - merge-tree.err
       - merge-tree.status
@@ -83,7 +87,11 @@ intrinsic_surface_declarations:
       - parent-delta.patch
       - summary.md.fragment
       - parent-pointer-check
-      - rolled-back.flag
+      - result.json
+      - owner.json
+      - state.json
+      - rollback-result.json
+      - tools/verified_rebase.py
   - component: workflows/verified-rebase.md
     role: intrinsic-surface
     Domain: verified_rebase_workflow_convention_operator_refs
@@ -130,18 +138,22 @@ jj-operator
 
 - BRANCH and TARGET refs for the rebase
 - optional SOURCE and PARENT_BUNDLE for scoped or stacked rebases
+- repo_root, external planning_dir, selected endpoint owner_invocation_id, fresh attempt_id UUID
 
 ### Expectations
 
+- selected endpoint directly owns all phases; no same-operation redispatch
+- persistent substrate reservation survives suspension and interruption
+- unknown/partial ownership and intervening state block without cleanup
 - produces a deterministic bundle for rebase review
 - computes mechanical provenance from predicted tree, actual tree, conflicts, and range-diff output
 - does not push and does not resolve conflicts
 
 ### Outputs
 
-- bundle under .tmp/verified-rebase/<branch-slug>/<timestamp>/
-- stdout verdict CLEAN, DIRTY-EXPLAINED, DIRTY-UNPROVENANCED, or BLOCKED
-- local refs/pre-rebase/<branch> rollback anchor and rollback.sh helper
+- bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
+- identity-bound result.json: separate mechanical verdict and execution terminal; no push eligibility
+- attempt-specific refs/pre-rebase/<attempt_id> anchor and owner-fenced rollback.sh
 
 ### Non-goals
 
@@ -151,6 +163,10 @@ jj-operator
 
 ## Inputs
 
+- `repo_root`: explicit colocated Git/jj substrate, not inferred from launch cwd.
+- `planning_dir`: existing external planning root, disjoint from any checkout or Git/jj metadata.
+- `owner_invocation_id` / shell `OWNER_ID`: this selected endpoint's authentic runner UUID, read from its native runtime identity after selection (not the caller/root UUID); unchanged on resume.
+- `attempt_id` / shell `ATTEMPT_ID`: fresh UUID allocated before dispatch; never reuse a slug, timestamp or PID.
 - `BRANCH` — branch to rebase (e.g. `feat/p2-version-parsing-unification`).
 - `TARGET` — ref to rebase onto. Either `origin/main` (main-target case) or a parent branch ref (stacked case, e.g. `feat/p2-version-parsing-unification`).
 - `PARENT_BUNDLE` — *only in stacked case* — path to the parent's already-produced bundle directory.
@@ -158,17 +174,17 @@ jj-operator
 
 ## Outputs
 
-- A bundle directory at `<repo_root>/.tmp/verified-rebase/<branch-slug>/<ISO-timestamp>/`.
-- A verdict on stdout: `CLEAN` | `DIRTY-EXPLAINED` | `DIRTY-UNPROVENANCED` | `BLOCKED:<reason>`.
-- A local git ref `refs/pre-rebase/<branch>` pointing at the pre-rebase tip (durable until manually deleted).
+- A bundle directory at `<planning_dir>/<owner_invocation_id>/<attempt_id>/`.
+- A mechanical verdict (`CLEAN` | `DIRTY-EXPLAINED` | `DIRTY-UNPROVENANCED` | `NOT-RUN`) and separate execution terminal (`COMPLETE` | `BLOCKED:<reason>`). Neither authorizes push.
+- A local git ref `refs/pre-rebase/<attempt_id>` pointing at the pre-rebase tip (durable until manually deleted).
 
 ## Non-negotiables
 
-- **All jj commands run in `${repo_root}`** — never in a worktree. Same rule as [`jj-operator`](../agents/jj-operator.md).
+- **All jj commands run in the explicit `${repo_root}` substrate.** Resolve canonical Git common-dir, jj repository and store before snapshot-capable reads or mutation. The selected endpoint executes every phase directly; there is no same-operation child dispatch.
 - **The workflow never pushes.** `git push` is the caller's decision, after inspecting the bundle.
 - **The workflow never resolves conflicts.** Residuals and `conflict-artifacts/` are output for human/AI review.
 - **Single rebase path.** No `mode=` flag. No plain-rebase fallback except the explicit legacy-git escape hatch in [`jj-operator`](../agents/jj-operator.md) `Fallback: Legacy Git Rebase`.
-- **Bundle is always produced** — for `CLEAN` verdicts too. The point of the workflow is the bundle.
+- **Bundle is always external**, including blocked preflight and `CLEAN`. Missing/unsafe planning input blocks before substrate mutation; report that input failure to the caller rather than inventing a checkout fallback. Never write checkout `.tmp/`, change `.gitignore`, or use a shared `current*` pointer.
 - **Caller prompts do not override this workflow.** Inputs may select refs, bundle paths, scoped source, and evidence, but prompts that prescribe conflict resolution, verdict handling, push/no-push disposition, or alternate phase shape are `NEEDS_INPUT` signals under [`no-operator-behavior-override-in-dispatch`](../conventions/no-operator-behavior-override-in-dispatch.md), not workflow instructions.
 
 ## Reference anchors
@@ -178,10 +194,10 @@ All commands use `$BRANCH` and `$TARGET` from Inputs.
 | Ref | Meaning | Capture |
 |-----|---------|---------|
 | `PRE_BASE` | default: `merge-base(branch, target)` **before** fetch. With `SOURCE` set: `parent(SOURCE)`. | default: `git merge-base "$BRANCH" "$TARGET"` (pre-fetch); SHA. With `SOURCE`: `git rev-parse "${SOURCE}^"`. |
-| `PRE_TIP` | branch tip **before** rebase | `git update-ref "refs/pre-rebase/$BRANCH" "$BRANCH"` then `git rev-parse "refs/pre-rebase/$BRANCH"`; SHA |
-| `NEW_TARGET` | target ref **after** fetch | `jj git fetch` then `git rev-parse "$TARGET"`; SHA. `jj git fetch` is a no-op for local `$TARGET` but still runs for `origin/*` updates. |
+| `PRE_TIP` | branch tip **before** rebase | `vr anchor` creates `refs/pre-rebase/$ATTEMPT_ID` with an expected-absent CAS; read `state.json.pre.PRE_TIP` |
+| `NEW_TARGET` | target ref **after** fetch | `vr fetch`, then `state.json.pre.NEW_TARGET`; fetch requires a configured remote even with a local target. |
 | `POST_TIP` | branch tip **after** rebase | `git rev-parse "$BRANCH"`; SHA |
-| `POST_CHANGE_ID` | jj change id of branch tip **after** rebase | `jj log -r "$BRANCH" --no-graph --no-pager --limit 1 --template 'change_id'`. Addresses post-rebase revision for `jj file show` / `jj resolve --list`. |
+| `POST_CHANGE_ID` | jj change id of branch tip **after** rebase | `jj_read log -r "$BRANCH" --no-graph --no-pager --limit 1 --template 'change_id'`. Addresses post-rebase revision for `jj file show` / `jj resolve --list`. |
 | `PREDICTED_TREE` | tree a clean 3-way merge would produce (merge-ort) | first line of `$BUNDLE/merge-tree.out`; valid tree oid. Captured even when `merge-tree.status` is `1` for an expected content conflict. |
 
 `PREDICTED_TREE` is a tree object, not a commit. Downstream diffs use it as a tree-ish alongside `$POST_TIP^{tree}`. Prediction command metadata is stored in `merge-tree.out`, `merge-tree.err`, and `merge-tree.status`.
@@ -190,9 +206,9 @@ All commands use `$BRANCH` and `$TARGET` from Inputs.
 
 ## Bundle schema
 
-Path: `<repo_root>/.tmp/verified-rebase/<branch-slug>/<ISO-timestamp>/`
+Path: `<planning_dir>/<owner_invocation_id>/<attempt_id>/`
 
-Slugging: replace `/` with `__`. Example: `feat/p2-version-parsing-unification` → `feat__p2-version-parsing-unification`. Deterministic and reversible.
+Bundle allocation uses UUIDs, not branch slugs. Preserve the exact branch separately; `a/b`, `a_b`, and `a__b` never address the same bundle. Directory creation is exclusive, not `mkdir -p` reuse. Pass the exact `$BUNDLE` throughout; never discover or source state from a shared pointer.
 
 | File | Producer | Required content |
 |------|----------|------------------|
@@ -209,54 +225,92 @@ Slugging: replace `/` with `__`. Example: `feat/p2-version-parsing-unification` 
 | `conflict-artifacts/files.txt` | Row-validation adapter over `conflict-artifacts/jj-resolve-list-raw.txt` | Row-validation adapter output. One validated bare conflicted repository path per non-empty line, produced from `conflict-artifacts/jj-resolve-list-raw.txt` per § 6. Empty if no conflicts. |
 | `conflict-artifacts/jj-resolve-list-raw.txt` | `jj resolve --list -r "$POST_CHANGE_ID" --no-pager` | Raw `jj resolve --list -r "$POST_CHANGE_ID" --no-pager` stdout sidecar; preserved for diagnostics. May contain jj's human-rendered `path<TAB>N-sided conflict` rows. NOT consumed by verdict computation, `.conflict` artifact production, or operator inspection prose. |
 | `conflict-artifacts/<slug>.conflict` | `jj file show -r "$POST_CHANGE_ID" "$path"` | jj's first-class conflict representation, per conflicted path |
-| `jj-op-log-before.txt` | `jj op log --limit 20 --no-pager` pre-rebase | Audit trail |
-| `jj-op-log-after.txt` | `jj op log --limit 20 --no-pager` post-rebase | Audit trail |
-| `jj-pre-op-id.txt` | `jj op log --limit 1 --no-graph --no-pager --template 'id'` (captured post-fetch, pre-rebase) | Rollback target |
-| `rollback.sh` | workflow (template below) | Idempotent, precondition-checked rollback helper |
+| `jj-op-log-before.txt` | `jj_read op log --limit 20 --no-pager` pre-rebase | Audit trail |
+| `jj-op-log-after.txt` | `jj_read op log --limit 20 --no-pager` post-rebase | Audit trail |
+| `jj-pre-op-id.txt` | `state.json.pre.JJ_PRE_OP_ID` (captured post-fetch, pre-rebase) | Rollback target |
+| `rollback.sh` | workflow (template below) | Pinned helper/path/owner/attempt invocation, no bare restore |
+| `owner.json` | internal helper | Immutable invocation UUID, attempt UUID, exact branch/target/source, bundle, canonical path + device/inode substrate identities, helper hash and attempt anchor |
+| `state.json` | internal helper | Durable operation checkpoint: full refs, HEAD, jj operation; completed labels and in-flight command intent; pre refs / post-fetch rollback operation |
+| `result.json` | internal helper | Owner, checkpoint, pre/post identities, mechanical verdict, execution terminal, evidence hashes, no push eligibility, pending caller synchronization; topology validation is operator-owned |
+| `rollback-result.json` | internal helper | Exact restored checkpoint; repeat is validated against current ownership/state, not a flag |
 | `parent-delta.patch` *(stacked only)* | copy of `$PARENT_BUNDLE/branch-actual.patch` | Parent's shift — what the child inherits from its parent's rebase |
 
 ## Phases
 
 Phases 1–11. All run in `${repo_root}`. `$BUNDLE` is the bundle directory created in phase 1.
 
-### 1. Preflight
+### 1. Allocate, reserve, then preflight
 
-- Verify `@` has no working-copy changes *or* `@` is an empty change. `jj status` must not show `Working copy changes:` with tracked files, unless they're safely stashed on a throwaway bookmark.
-- Verify `$BRANCH` exists locally: `jj log -r "$BRANCH" --no-pager --limit 1` succeeds.
-- Verify `$TARGET` exists: `git rev-parse --verify "$TARGET"` succeeds.
-- If `$SOURCE` is set: verify `git rev-parse --verify "$SOURCE"` succeeds **and** `git merge-base --is-ancestor "$SOURCE" "$BRANCH"` returns 0.
-- Verify `.tmp/` is in repo-root `.gitignore`. If not, append a single line `.tmp/` and commit to a throwaway jj change (never directly to `main`).
-- Create `$BUNDLE = <repo_root>/.tmp/verified-rebase/$(echo "$BRANCH" | tr '/' '__')/$(date -u -Iseconds)/`.
+Use the internal helper shipped beside this workflow. This is a local CLI, not an
+agent dispatch. `$VR_HELPER` is its absolute path in the authoritative checkout;
+keep that exact helper available (owner record pins its hash). All logs, prompts,
+state and diagnostic bundles go under the externally supplied planning root.
 
-Stop: `BLOCKED:dirty-working-copy` | `BLOCKED:branch-not-found` | `BLOCKED:target-not-found` | `BLOCKED:source-not-found` | `BLOCKED:source-not-ancestor-of-branch`.
+```bash
+set -euo pipefail
+SOURCE_ARGS=()
+if [ -n "${SOURCE:-}" ]; then SOURCE_ARGS=(--source "$SOURCE"); fi
+BUNDLE=$(python3 "$VR_HELPER" allocate --repo "$repo_root" --planning "$planning_dir" \
+  --owner-id "$OWNER_ID" --attempt-id "$ATTEMPT_ID" --branch "$BRANCH" --target "$TARGET" \
+  "${SOURCE_ARGS[@]}" | jq -er .)
+# In bash, define local command helpers once; never source generated shell state.
+vr() { python3 "$VR_HELPER" "$1" --bundle "$BUNDLE" --owner-id "$OWNER_ID" --attempt-id "$ATTEMPT_ID" "${@:2}"; }
+jj_read() { vr inspect >/dev/null && jj --ignore-working-copy --at-operation "$(jq -r .checkpoint.op "$BUNDLE/state.json")" --no-pager "$@"; }
+cd "$repo_root"
+vr check
+```
+
+Allocation uses nonblocking transition locks and persistent records in **all**
+canonical Git common-dir / jj repository / jj store resources, independent of
+branch name. The operation-wide reservation is not the short-lived OS lock:
+process exit or suspension does not free it. A partial record, unknown owner,
+live transition, or unavailable resource blocks before rebase or snapshot.
+Owner/attempt path collisions never overwrite bytes. An allocation contender
+writes only its own external `allocation-blocked.json`.
+
+Preflight after reservation:
+- Require clean tracked/index/untracked/ignored source inventory and an empty jj
+  working-copy change. No stash, ignore repair, reset, or automatic cleanup.
+- Verify `$BRANCH` and `$TARGET` exist; verify `$SOURCE` exists and is an ancestor
+  of `$BRANCH` when supplied. Use `jj_read` for jj inspection.
+- Preserve all foreign files. On unexpected state diagnose using Git no-optional-
+  locks reads and pinned no-snapshot jj reads, never ordinary `jj status`.
+
+On a preflight block, write the reason externally and use phase 10's `BLOCKED`
+terminal path if current ownership/checkpoint still validates. Otherwise preserve
+the reservation and partial evidence and return `BLOCKED:recovery-required`.
+Missing planning inputs have no safe bundle destination: return the error without
+writing to the substrate. Never take over by age or PID.
 
 ### 2. Capture PRE state
 
 ```bash
-if [ -n "${SOURCE:-}" ]; then
-  PRE_BASE=$(git rev-parse "${SOURCE}^")
-else
-  PRE_BASE=$(git merge-base "$BRANCH" "$TARGET")
-fi
-git update-ref "refs/pre-rebase/$BRANCH" "$BRANCH"
-PRE_TIP=$(git rev-parse "refs/pre-rebase/$BRANCH")
-jj op log --limit 20 --no-pager > "$BUNDLE/jj-op-log-before.txt"
+vr anchor
+PRE_BASE=$(jq -er .pre.PRE_BASE "$BUNDLE/state.json")
+PRE_TIP=$(jq -er .pre.PRE_TIP "$BUNDLE/state.json")
+jj_read op log --limit 20 > "$BUNDLE/jj-op-log-before.txt"
 ```
 
-The `refs/pre-rebase/$BRANCH` ref overwrites unconditionally. Stale refs from prior runs are replaced.
+The helper creates `refs/pre-rebase/$ATTEMPT_ID` with an expected-absent CAS.
+It never overwrites another attempt's anchor, even for the same branch.
 
 ### 3. Fetch
 
 ```bash
-jj git fetch
-NEW_TARGET=$(git rev-parse "$TARGET")
-JJ_PRE_OP_ID=$(jj op log --limit 1 --no-graph --no-pager --template 'id')
-echo "$JJ_PRE_OP_ID" > "$BUNDLE/jj-pre-op-id.txt"
+vr fetch
+NEW_TARGET=$(jq -er .pre.NEW_TARGET "$BUNDLE/state.json")
+JJ_PRE_OP_ID=$(jq -er .pre.JJ_PRE_OP_ID "$BUNDLE/state.json")
+printf '%s\n' "$JJ_PRE_OP_ID" > "$BUNDLE/jj-pre-op-id.txt"
 ```
 
-`jj git fetch` is a no-op for a local `$TARGET` ref but still pulls `origin/*` updates. `JJ_PRE_OP_ID` is captured *after* fetch (so fetch is part of the baseline) and *before* any rebase mutation — this is the rollback target.
+Fetch is journaled under the reservation. Its exact post-fetch operation is the
+rollback baseline. A failed/ambiguous command leaves an in-flight record and
+reservation; no automatic replay. Missing origin is a real fetch failure, not a
+successful local-target no-op.
 
-Stop: `BLOCKED:fetch-failed`.
+Before each subsequent phase, run `vr check` (or `vr inspect` for blocked,
+no-snapshot diagnostics). Never advance after a failed check. All mutations use
+the helper, which journals intent before execution and readback afterward.
 
 ### 4. Predict
 
@@ -285,19 +339,22 @@ fi
 
 ### 5. Rebase
 
-Delegate to [`jj-operator`](../agents/jj-operator.md) `Procedure: Verified Rebase` (the single rebase path). The operator runs:
+The **same selected endpoint** performs the local step; it does not delegate to
+itself, a wrapper, or a rebase child:
 
 ```bash
-if [ -n "${SOURCE:-}" ]; then
-  jj --config 'revset-aliases."immutable_heads()"="none()"' \
-    rebase -s "$SOURCE" -d "$NEW_TARGET"
-else
-  jj --config 'revset-aliases."immutable_heads()"="none()"' \
-    rebase -b "$BRANCH" -d "$NEW_TARGET"
-fi
+vr rebase
+# If divergent revisions exist, select only a proven stale pre-rebase commit:
+# vr abandon --revision <exact-old-commit-id>
 ```
 
-followed by divergent-revision cleanup per the operator. The operator **does not push**.
+The helper executes the existing `jj --ignore-working-copy --config
+'revset-aliases."immutable_heads()"="none()"' rebase -s "$SOURCE" -d "$NEW_TARGET"`
+or `rebase -b "$BRANCH" -d "$NEW_TARGET"` with the frozen inputs and target. A
+completed label cannot run twice. Divergent cleanup is also journaled/fenced;
+it must prove a current surviving revision with the same change ID and must not
+abandon a current or foreign commit. Unprovable cleanup blocks, never falls back
+to a naked command. No push or worktree synchronization runs here.
 
 Stop: `BLOCKED:rebase-failed` (rare; jj accepts conflicts and stores them as first-class tree values).
 
@@ -305,12 +362,12 @@ Stop: `BLOCKED:rebase-failed` (rare; jj accepts conflicts and stores them as fir
 
 ```bash
 POST_TIP=$(git rev-parse "$BRANCH")
-POST_CHANGE_ID=$(jj log -r "$BRANCH" --no-graph --no-pager --limit 1 --template 'change_id')
-jj op log --limit 20 --no-pager > "$BUNDLE/jj-op-log-after.txt"
+POST_CHANGE_ID=$(jj_read log -r "$BRANCH" --no-graph --no-pager --limit 1 --template 'change_id')
+jj_read op log --limit 20 > "$BUNDLE/jj-op-log-after.txt"
 
 mkdir -p "$BUNDLE/conflict-artifacts"
 # Capture raw jj resolve --list stdout to a diagnostic sidecar first (ACR-260 precedent).
-jj resolve --list -r "$POST_CHANGE_ID" --no-pager \
+jj_read resolve --list -r "$POST_CHANGE_ID" \
   > "$BUNDLE/conflict-artifacts/jj-resolve-list-raw.txt" 2>/dev/null || true
 
 # Row-validation adapter: validate each non-empty raw line and emit only validated bare paths
@@ -333,7 +390,7 @@ done < "$BUNDLE/conflict-artifacts/jj-resolve-list-raw.txt"
 while IFS= read -r P; do
   [ -z "$P" ] && continue
   SLUG=$(echo "$P" | tr '/' '__')
-  jj file show -r "$POST_CHANGE_ID" "$P" \
+  jj_read file show -r "$POST_CHANGE_ID" "$P" \
     > "$BUNDLE/conflict-artifacts/${SLUG}.conflict"
 done < "$BUNDLE/conflict-artifacts/files.txt"
 ```
@@ -369,7 +426,7 @@ Verdict:
 
 `DIRTY-EXPLAINED` proves mechanical provenance: every residual hunk sits in a file that had a conflict. The reviewer still has to judge each resolution's correctness semantically — the gate doesn't claim the resolution was *right*, only that it had a provenance.
 
-`DIRTY-UNPROVENANCED` is the only blocking verdict. It means either (a) content changed in a file that had no conflict, or (b) a commit was dropped/reordered without explanation. Both require human review.
+`DIRTY-UNPROVENANCED` is the blocking **mechanical** verdict. Execution ownership/cleanliness/currentness can independently block even a `CLEAN` mechanical result. It means either (a) content changed in a file that had no conflict, or (b) a commit was dropped/reordered without explanation. Both require human review.
 
 In the stacked case where `PREDICTED_TREE` collapses (see §3.4 of [the proposal](../.build/VR-01-verified-rebase-proposal.md)), `residual.patch` is often trivially empty — the load for the child's content check is carried by `conflict-artifacts`, `range-diff.txt`, and the parent-pointer invariant (§9 below), not `residual.patch` alone.
 
@@ -387,47 +444,81 @@ cp "$PARENT_BUNDLE/branch-actual.patch" "$BUNDLE/parent-delta.patch"
 
 The pointer invariant `parent.POST_TIP == child.NEW_TARGET` is the only cross-bundle invariant. FAIL means the child was rebased onto the wrong commit.
 
-### 10. Write bundle
+### 10. Freeze terminal evidence and release
 
-Assemble `summary.md` and `refs.json` from the captured variables. Write `rollback.sh` from the template below. Ensure `rollback.sh` is executable (`chmod +x`).
-
-**`rollback.sh` template:**
+Assemble `summary.md`, `refs.json`, all patches and diagnostics **before** terminal
+publication. Include exact invocation/attempt/substrate/bundle, pre/post refs and
+operations, mechanical verdict, execution status, and pending sync/review/push
+obligations. Write `rollback.sh` as a pinned invocation of the same helper:
 
 ```bash
 #!/bin/bash
-set -e
-BUNDLE="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "$BUNDLE/rolled-back.flag" ]; then
-  echo "Already rolled back at $(cat "$BUNDLE/rolled-back.flag"). No-op."
-  exit 0
-fi
-OP_ID=$(cat "$BUNDLE/jj-pre-op-id.txt")
-if ! jj op log --no-graph --no-pager --limit 1000 --template 'id ++ "\n"' \
-      | grep -qx "$OP_ID"; then
-  echo "ERROR: op $OP_ID not in jj op log (likely GC'd). Manual recovery required." >&2
-  exit 2
-fi
-jj op restore "$OP_ID"
-date -Iseconds > "$BUNDLE/rolled-back.flag"
-echo "Rolled back to $OP_ID."
+set -euo pipefail
+# Generator substitutes shell-quoted absolute literals, not caller cwd or current pointers:
+exec python3 <pinned-VR_HELPER> rollback --bundle <exact-BUNDLE> \
+  --owner-id <OWNER_ID> --attempt-id <ATTEMPT_ID>
 ```
 
-Rollback limits:
+Use a shell-quoting encoder (e.g. `shlex.quote`) for every substituted value,
+then `chmod +x "$BUNDLE/rollback.sh"` before terminal evidence is frozen.
+The helper validates its own hash, owner, attempt, canonical substrate identities,
+all refs and jj operation, clean source, and the exact attempt anchor. Rollback
+reacquires the same resources and refuses any intervening owner **even if that
+owner finished without changing refs**. It refuses a later clean jj operation,
+dirty source, replaced anchor, or incomplete journal. Current rollback restores
+only the captured post-fetch operation and verifies restored topology refs/HEAD.
+The exact pinned post-rebase `refs/jj/keep/*` GC roots are retained (not deleted
+or broadly ignored); any other restore readback difference blocks. Repeat validates the new checkpoint and
+owner before a no-op. No bare restore, age/operation-existence heuristic or
+`rolled-back.flag` shortcut is permitted. It never pushes or synchronizes worktrees.
 
-- Rollback is **local-only**. If a push happened between the rebase and the rollback, the remote branch is not unpushed — caller must `git push --force-with-lease` after rollback if a push occurred.
-- `jj op log` default TTL is ~30 days; the precondition check fails with exit 2 if the op id was GC'd.
-- The flag file makes re-running the script a safe no-op.
+The operator must establish that it directly executed this operation with no
+same-operation children still live. Preserve native invocation/subtree evidence
+externally; the helper's `topology_validation: operator-owned` is **not** a process-
+tree proof. A successful parent turn or helper exit alone cannot establish that.
+Unresolved prior child or ambiguous termination means retain reservation and
+report blocked, not release. After evidence is complete and all tool/child
+activity terminal (not a claim that this still-running endpoint has exited):
 
-### 11. Return verdict
+```bash
+vr finish --mechanical "$MECHANICAL" --execution "$EXECUTION" --reason "${REASON:-}"
+vr release
+```
 
-Print one of:
+`EXECUTION=COMPLETE` requires a completed rebase and final clean/current state.
+`EXECUTION=BLOCKED` can retain `MECHANICAL=CLEAN` (for example, unexpected foreign
+files after rebase) but always has `push_eligible=false`. A state/ownership mismatch
+or in-flight command prevents finish/release: write a uniquely named external
+diagnostic, preserve everything, and hand back `BLOCKED:recovery-required`.
+Do not alter canonical evidence after `finish`; `release` checks its hashes.
 
-- `CLEAN` — bundle produced; caller may push freely.
-- `DIRTY-EXPLAINED` — bundle produced; residuals confined to files that had conflicts; caller reviews resolutions before deciding to push.
-- `DIRTY-UNPROVENANCED` — bundle produced; residuals include paths without conflict provenance or range-diff anomalies; **caller reviews before any push**.
-- `BLOCKED:<reason>` — see the stop conditions in phases 1–5.
+Clean completion marks only this owner's records released; it does not delete
+bundles, anchors, guards, worktrees or substrates. Released records remain as
+lineage tombstones. Keep all owner-recorded evidence. Unknown/partial ownership
+never authorizes cleanup. No recursive deletion or automatic lock stealing.
 
-Caller decides push/rollback. This workflow does neither.
+Suspension with a complete checkpoint resumes only the **same owner/attempt**
+with fresh identity/state checks; skip recorded completed steps. Interruption
+inside a command, partial reservation, or changed state requires explicit
+operator recovery handoff and investigation; the helper intentionally offers no
+force/unlock/reset option. Preserve the old evidence. Use a genuinely independent
+substrate and new attempt ID for an independent rerun, not a renamed old path.
+
+### 11. Return identity-bound disposition
+
+Return the exact external bundle and `result.json`, mechanical verdict, execution
+terminal and reservation disposition. Print `BLOCKED:<reason>` for a blocked or
+unresolved execution, even when residuals are empty. For completed executions,
+report `CLEAN`, `DIRTY-EXPLAINED`, or `DIRTY-UNPROVENANCED` as **mechanical only**.
+After release, perform no further substrate mutation. The caller must join the
+endpoint's authentic terminal/subtree readback with this result before reuse or
+publication; the still-running endpoint cannot certify its own future runner exit.
+
+Caller owns acceptance, worktree synchronization, required tests and review,
+then separately authorized publication with an exact expected-old-OID lease and
+remote readback. No verdict means “push freely”; neither a terminal record nor
+an empty residual grants publication or rollback authority. Rollback requires
+the caller's existing authorization and the fenced local helper above.
 
 ## Stacked branches
 
@@ -436,7 +527,7 @@ Bottom-up recursion, using the workflow inputs:
 1. Run for the parent — `BRANCH=<parent>`, `TARGET=origin/main`, no `PARENT_BUNDLE`. Bundle A produced.
 2. jj auto-rebases the child when the parent moves. Run for the child — `BRANCH=<child>`, `TARGET=<parent>`, `PARENT_BUNDLE=<path-to-A>`. Bundle B produced with `parent-pointer-check` recorded.
 
-`refs/pre-rebase/<child>` is overwritten unconditionally in phase 2, so a prior run's stale ref does not contaminate the child bundle's baseline.
+Each child attempt creates its own `refs/pre-rebase/<attempt_id>` anchor without overwriting the parent or a prior child. Complete/release the parent before acquiring the child on the same substrate; stacked order is sequential, not live same-operation recursion.
 
 ## Stale parent history
 
@@ -459,15 +550,15 @@ This case is structurally distinct from a content conflict — recovery is mecha
 
 ## Tests (contract)
 
-Workflow files aren't unit-testable. The contract is:
+Runnable helper/procedure fixtures: `python3 -m unittest discover -s evals/verified-rebase-substrate-isolation -v`. See that directory's coverage limits; the table below remains the full mechanical contract, not a claim every row was executed.
 
 | # | Scenario | Expected verdict / artifacts |
 |---|----------|------------------------------|
 | T1 | Conflict-free rebase; non-overlapping main changes | `CLEAN`. `residual.patch` empty. `range-diff.txt` shows `=` for every branch commit. |
 | T2 | Text conflict on a line both sides edited | `DIRTY-EXPLAINED`. `residual.patch` touches only the conflicted file. `conflict-artifacts/<slug>.conflict` non-empty. |
 | T3 | Stacked parent/child rebase | Two bundles. Bundle B's `summary.md` shows `parent-pointer-check: PASS`. |
-| T4 | `rollback.sh` after a rebase | Branch ref back to `PRE_TIP`. `refs/pre-rebase/<branch>` intact. `rolled-back.flag` exists. Re-running is no-op. |
-| T5 | Live exercise — production branches | Bundles produced; no push; verdicts reported; rollback available. |
+| T4 | `rollback.sh` after a rebase | Branch ref back to `PRE_TIP`. `refs/pre-rebase/<attempt_id>` intact. `rollback-result.json` records the restored operation. Re-running is an owner/currentness-validated no-op. |
+| T5 | Disposable production-shaped branches (never live production in regressions) | Bundles produced; no push; verdicts reported; fenced rollback available. |
 | T6 | No-op rebase (branch already up-to-date with target) | `CLEAN`. `target-delta` empty. `branch-intended` == `branch-actual`. |
 | T7 | Rename conflict (main renames a file the branch edited) | `DIRTY-EXPLAINED` with rename-present flag; OR `DIRTY-UNPROVENANCED` if ort/jj disagree (flagged as rename-detection divergence). |
 | T8 | Delete conflict (main deletes, branch modifies) | `DIRTY-EXPLAINED`. `conflict-artifacts/<slug>.conflict` shows the deletion side. |
