@@ -98,6 +98,7 @@ def substrate(repo):
     require(git(repo, 'rev-parse', '--show-toplevel') == str(repo), 'not-repository-root')
     common = Path(git(repo, 'rev-parse', '--path-format=absolute', '--git-common-dir'))
     jjrepo = repo / '.jj/repo'
+    require(jjrepo.exists(), 'colocated-jj-required:no-manual-rebase')
     if jjrepo.is_file():
         jjrepo = jjrepo.parent / jjrepo.read_text().strip()
     jjrepo = jjrepo.resolve(strict=True)
@@ -196,25 +197,53 @@ def external_planning(planning, identity):
 
 def allocate(repo, planning, owner_id, attempt_id, branch, target, source=None):
     owner_id, attempt_id = str(uuid.UUID(owner_id)), str(uuid.UUID(attempt_id))
-    identity = substrate(repo)
-    planning = external_planning(planning, identity)
+    # Establish an external refusal destination before probing the substrate.
+    # Unsupported/manual Git worktrees and absent jj must not select a fallback.
+    planning = external_planning(planning, {})
+    identity, substrate_error = None, None
+    try:
+        identity = substrate(repo)
+    except (Blocked, OSError, ValueError, KeyError) as error:
+        substrate_error = error
+    if identity is not None:
+        external_planning(planning, identity)
     bundle = planning / owner_id / attempt_id
     bundle.parent.mkdir(exist_ok=True, mode=0o700)
     require(not bundle.parent.is_symlink(), 'symlink-owner-directory')
-    bundle.mkdir(mode=0o700)  # exclusive; never reuse a bundle or a branch slug
-    owner = {'schema': 1, 'owner_id': owner_id, 'attempt_id': attempt_id,
-             'branch': branch, 'target': target, 'source': source,
-             'bundle': str(bundle), 'substrate': identity,
-             'anchor': f'refs/pre-rebase/{attempt_id}',
-             'helper_sha256': digest(Path(__file__).read_bytes())}
-    write(bundle / 'owner.json', owner, exclusive=True)
+    bundle.mkdir(mode=0o700)
+    request = {'owner_id': owner_id, 'attempt_id': attempt_id,
+               'repo': str(Path(repo).resolve()), 'branch': branch, 'target': target,
+               'source': source, 'bundle': str(bundle),
+               'helper_sha256': digest(Path(__file__).read_bytes())}
+    write(bundle / 'request.json', request, exclusive=True)
+    owner = None
     try:
+        if substrate_error is not None:
+            raise substrate_error
+        probe_jj(identity['root']['path'], bundle)
+        owner = {'schema': 1, **{k: request[k] for k in
+                 ('owner_id', 'attempt_id', 'branch', 'target', 'source', 'bundle', 'helper_sha256')},
+                 'substrate': identity, 'anchor': f'refs/pre-rebase/{attempt_id}'}
+        write(bundle / 'owner.json', owner, exclusive=True)
         reserve(owner)
     except (Blocked, OSError, ValueError, KeyError) as error:
         write(bundle / 'allocation-blocked.json', {'execution': 'BLOCKED', 'reason': str(error),
-              'owner': owner, 'push_eligible': False}, exclusive=True)
+              'request': request, 'owner': owner, 'push_eligible': False}, exclusive=True)
         raise
     return str(bundle)
+
+
+def probe_jj(repo, bundle):
+    args = ['jj', '--version']
+    try:
+        result = invoke(repo, args)
+    except OSError as error:
+        write(bundle / 'jj-probe.json', {'args': args, 'error': str(error)}, exclusive=True)
+        raise Blocked('jj-unavailable:no-rebase-fallback') from error
+    write(bundle / 'jj-probe.json', {'args': args, 'returncode': result.returncode,
+          'stdout_base64': base64.b64encode(result.stdout).decode(),
+          'stderr_base64': base64.b64encode(result.stderr).decode()}, exclusive=True)
+    require(result.returncode == 0, 'jj-unavailable:no-rebase-fallback')
 
 
 def reserve(owner):
@@ -274,7 +303,9 @@ class Attempt:
         label, args = self.mutation(state, action, revision)
         require(label not in state['completed'], 'command-already-completed')
         if action == 'anchor':
-            state['pre'] = self.pre_refs()
+            state['pre'] = self.pre_refs(state['checkpoint'])
+        # Read-only source/cleanup resolution must not authorize an intervening operation.
+        self.validate()
         nonce = str(uuid.uuid4())
         if args[0] == 'jj':
             args[1:1] = ['--at-operation', state['checkpoint']['op'],
@@ -386,20 +417,39 @@ class Attempt:
         return f'abandon-{revision}', base_jj + ['--config', 'revset-aliases."immutable_heads()"="none()"',
                                               'abandon', revision]
 
-    def pre_refs(self):
+    def pre_refs(self, checkpoint):
         owner = self.owner
         pre_tip = git(self.repo, 'rev-parse', '--verify', f'{owner["branch"]}^{{commit}}')
         base = git(self.repo, 'merge-base', owner['branch'], owner['target'])
         source = None
         if owner['source']:
-            source = git(self.repo, 'rev-parse', '--verify', f'{owner["source"]}^{{commit}}')
+            source = self.resolve_source(checkpoint)
             git(self.repo, 'merge-base', '--is-ancestor', source, pre_tip)
             base = git(self.repo, 'rev-parse', source + '^')
         return {'PRE_TIP': pre_tip, 'PRE_BASE': base, 'SOURCE_COMMIT': source,
-                'CLEANUP_CANDIDATES': self.pre_cleanup_candidates(base, pre_tip)}
+                'SOURCE_OPERATION': checkpoint['op'] if source else None,
+                'CLEANUP_CANDIDATES': self.pre_cleanup_candidates(base, pre_tip, checkpoint['op'])}
 
-    def pre_cleanup_candidates(self, base, tip):
-        op = snapshot(self.identity)['op']
+    def resolve_source(self, checkpoint):
+        # No --limit: cardinality is a contract, not a best-effort first match.
+        args = ['jj', '--ignore-working-copy', '--no-pager', '--at-operation', checkpoint['op'],
+                'log', '-r', self.owner['source'], '--no-graph', '-T', 'commit_id ++ "\\n"']
+        result = invoke(self.repo, args)
+        write(self.bundle / f'source-resolution-{uuid.uuid4()}.json', {
+            'source': self.owner['source'], 'checkpoint': checkpoint, 'args': args,
+            'returncode': result.returncode,
+            'stdout_base64': base64.b64encode(result.stdout).decode(),
+            'stderr_base64': base64.b64encode(result.stderr).decode()}, exclusive=True)
+        require(result.returncode == 0, 'source-resolution-failed')
+        commits = result.stdout.decode().splitlines()
+        require(len(commits) == 1, 'source-requires-single-commit')
+        source = commits[0]
+        require(re.fullmatch(r'[0-9a-f]{40}|[0-9a-f]{64}', source), 'invalid-source-commit-id')
+        require(git(self.repo, 'rev-parse', '--verify', source + '^{commit}') == source,
+                'source-git-identity-mismatch')
+        return source
+
+    def pre_cleanup_candidates(self, base, tip, op):
         ids = jj(self.repo, '--at-operation', op, 'log', '-r', f'{base}..{tip}',
                  '--no-graph', '-T', 'change_id ++ "\\n"').splitlines()
         candidates = {}

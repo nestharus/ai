@@ -17,6 +17,8 @@ expectations:
 - conflict artifacts preserve injective source-path associations in conflict-artifacts/index.json
 - executable source-bound logical residual and complete change correspondence determine mechanical verdicts
 - complete summary refs parent associations and rollback artifacts are required before terminal publication
+- unavailable jj or unsupported manual-worktree substrates refuse externally before reservation or branch mutation
+- SOURCE accepts Git SHA or singleton jj revset resolved at the owned pre-anchor checkpoint
 outputs:
 - bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
 - identity-bound result.json with separate mechanical verdict and execution terminal; no push eligibility

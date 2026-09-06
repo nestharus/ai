@@ -861,7 +861,9 @@
           "command-return checkpoints require owned operation lineage and attributable Git effects",
           "conflict artifacts preserve injective source-path associations in conflict-artifacts/index.json",
           "executable source-bound logical residual and complete change correspondence determine mechanical verdicts",
-          "complete summary refs parent associations and rollback artifacts are required before terminal publication"
+          "complete summary refs parent associations and rollback artifacts are required before terminal publication",
+          "unavailable jj or unsupported manual-worktree substrates refuse externally before reservation or branch mutation",
+          "SOURCE accepts Git SHA or singleton jj revset resolved at the owned pre-anchor checkpoint"
         ],
         "inputs": [
           "BRANCH and TARGET refs for the rebase",

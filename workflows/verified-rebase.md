@@ -18,6 +18,8 @@ workflow_dispatch_contract:
   - conflict artifacts preserve injective source-path associations in conflict-artifacts/index.json
   - executable source-bound logical residual and complete change correspondence determine mechanical verdicts
   - complete summary refs parent associations and rollback artifacts are required before terminal publication
+  - unavailable jj or unsupported manual-worktree substrates refuse externally before reservation or branch mutation
+  - SOURCE accepts Git SHA or singleton jj revset resolved at the owned pre-anchor checkpoint
   outputs:
   - bundle under <planning_dir>/<owner_invocation_id>/<attempt_id>/
   - identity-bound result.json with separate mechanical verdict and execution terminal; no push eligibility
@@ -65,7 +67,6 @@ intrinsic_surface_declarations:
       - git diff
       - git range-diff
       - git log
-      - git push --force-with-lease
       - refs/pre-rebase/<attempt_id>
   - component: workflows/verified-rebase.md
     role: intrinsic-surface
@@ -175,7 +176,7 @@ jj-operator
 - `BRANCH` — branch to rebase (e.g. `feat/p2-version-parsing-unification`).
 - `TARGET` — ref to rebase onto. Either `origin/main` (main-target case) or a parent branch ref (stacked case, e.g. `feat/p2-version-parsing-unification`).
 - `PARENT_BUNDLE` — *only in stacked case* — path to the parent's already-produced bundle directory.
-- `SOURCE` (optional) — git SHA or jj revset marking the first commit in `BRANCH`'s unique contribution. When set, the rebase is scoped to `SOURCE` and its descendants instead of the full `merge-base(BRANCH, TARGET)..BRANCH` range. Use this when `BRANCH` carries stale copies of `TARGET`'s commits because the parent was rewritten without `BRANCH` being rebased at the same time. See "Stale parent history" below.
+- `SOURCE` (optional) — Git SHA or singleton jj revset marking the first commit in `BRANCH`'s unique contribution. When set, the rebase is scoped to `SOURCE` and its descendants instead of the full `merge-base(BRANCH, TARGET)..BRANCH` range. Use this when `BRANCH` carries stale copies of `TARGET`'s commits because the parent was rewritten without `BRANCH` being rebased at the same time. The helper resolves exactly one commit with no-snapshot jj at the owned pre-anchor checkpoint, records raw resolution and `SOURCE_OPERATION`, then uses only `SOURCE_COMMIT` for Git ancestry, prediction and rebase. Invalid, empty, multiple or non-ancestor selections refuse before anchor/fetch/rebase, preserving evidence. See "Stale parent history" below.
 
 ## Outputs
 
@@ -188,7 +189,7 @@ jj-operator
 - **All jj commands run in the explicit `${repo_root}` substrate.** Resolve canonical Git common-dir, jj repository and store before snapshot-capable reads or mutation. The selected endpoint executes every phase directly; there is no same-operation child dispatch.
 - **The workflow never pushes.** `git push` is the caller's decision, after inspecting the bundle.
 - **The workflow never resolves conflicts.** Residuals and `conflict-artifacts/` are output for human/AI review.
-- **Single rebase path.** No `mode=` flag. No plain-rebase fallback except the explicit legacy-git escape hatch in [`jj-operator`](../agents/jj-operator.md) `Fallback: Legacy Git Rebase`.
+- **Single rebase path.** No `mode=` flag. No plain-rebase or legacy-Git fallback. Unavailable jj or manual-worktree needs fail closed/hand back under [`jj-operator`](../agents/jj-operator.md) `Unavailable jj or Manual-Worktree Rebase Request`; they never authorize alternate mechanics or push.
 - **Bundle is always external**, including blocked preflight and `CLEAN`. Missing/unsafe planning input blocks before substrate mutation; report that input failure to the caller rather than inventing a checkout fallback. Never write checkout `.tmp/`, change `.gitignore`, or use a shared `current*` pointer.
 - **Caller prompts do not override this workflow.** Inputs may select refs, bundle paths, scoped source, and evidence, but prompts that prescribe conflict resolution, verdict handling, push/no-push disposition, or alternate phase shape are `NEEDS_INPUT` signals under [`no-operator-behavior-override-in-dispatch`](../conventions/no-operator-behavior-override-in-dispatch.md), not workflow instructions.
 
@@ -198,7 +199,7 @@ All commands use `$BRANCH` and `$TARGET` from Inputs.
 
 | Ref | Meaning | Capture |
 |-----|---------|---------|
-| `PRE_BASE` | default: `merge-base(branch, target)` **before** fetch. With `SOURCE` set: `parent(SOURCE)`. | default: `git merge-base "$BRANCH" "$TARGET"` (pre-fetch); SHA. With `SOURCE`: `git rev-parse "${SOURCE}^"`. |
+| `PRE_BASE` | default: `merge-base(branch, target)` **before** fetch. With `SOURCE` set: `parent(SOURCE)`. | default: `git merge-base "$BRANCH" "$TARGET"` (pre-fetch); SHA. With `SOURCE`: pinned jj resolution to `SOURCE_COMMIT`, then `git rev-parse "${SOURCE_COMMIT}^"`. |
 | `PRE_TIP` | branch tip **before** rebase | `vr anchor` creates `refs/pre-rebase/$ATTEMPT_ID` with an expected-absent CAS; read `state.json.pre.PRE_TIP` |
 | `NEW_TARGET` | target ref **after** fetch | `vr fetch`, then `state.json.pre.NEW_TARGET`; fetch requires a configured remote even with a local target. |
 | `POST_TIP` | branch tip **after** rebase | `git rev-parse "$BRANCH"`; SHA |
@@ -237,6 +238,8 @@ Bundle allocation uses UUIDs, not branch slugs. Preserve the exact branch separa
 | `jj-op-log-after.txt` | `jj_read op log --limit 20 --no-pager` post-rebase | Audit trail |
 | `jj-pre-op-id.txt` | `state.json.pre.JJ_PRE_OP_ID` (captured post-fetch, pre-rebase) | Rollback target |
 | `rollback.sh` | workflow (template below) | Pinned helper/path/owner/attempt invocation, no bare restore |
+| `request.json` / `jj-probe.json` / `allocation-blocked.json` | internal helper | Exact requested inputs and raw jj availability probe or pre-reservation refusal; allocation failure confers no ownership or success |
+| `source-resolution-<uuid>.json` | internal helper | Raw exact-input jj resolution command/output and owned checkpoint, including zero/multiple/invalid results; no truncation or first-match selection |
 | `owner.json` | internal helper | Immutable invocation UUID, attempt UUID, exact branch/target/source, bundle, canonical path + device/inode substrate identities, helper hash and attempt anchor |
 | `state.json` | internal helper | Durable operation checkpoint: full refs, HEAD, jj operation; completed labels and in-flight command intent; pre refs / post-fetch rollback operation, pre-rebase cleanup candidate IDs, assembly checkpoint and complete artifact hashes |
 | `result.json` | internal helper | Owner, checkpoint, pre/post identities, mechanical verdict, execution terminal, evidence hashes, no push eligibility, pending caller synchronization; topology validation is operator-owned |
@@ -268,19 +271,30 @@ cd "$repo_root"
 vr check
 ```
 
-Allocation uses nonblocking transition locks and persistent records in **all**
+Allocation first verifies the external planning root and canonical substrate without
+snapshot-capable commands. Unavailable jj or missing colocated metadata (including
+Git-only/manual worktrees) writes `allocation-blocked.json` in the exact external
+owner/attempt directory, without reservation, anchor, fetch, branch mutation or
+push. No owner means no `finish`/`release` action: return the refusal and hand back.
+Unsafe/missing planning input returns an error without substrate writes. These
+conditions never select Git fallback commands or initialize an unowned substrate.
+
+Supported allocation uses nonblocking transition locks and persistent records in **all**
 canonical Git common-dir / jj repository / jj store resources, independent of
 branch name. The operation-wide reservation is not the short-lived OS lock:
 process exit or suspension does not free it. A partial record, unknown owner,
 live transition, or unavailable resource blocks before rebase or snapshot.
 Owner/attempt path collisions never overwrite bytes. An allocation contender
-writes only its own external `allocation-blocked.json`.
+retains its request/probe/owner and `allocation-blocked.json` only in its own
+external bundle; it never edits the incumbent bundle.
 
 Preflight after reservation:
 - Require clean tracked/index/untracked/ignored source inventory and an empty jj
   working-copy change. No stash, ignore repair, reset, or automatic cleanup.
-- Verify `$BRANCH` and `$TARGET` exist; verify `$SOURCE` exists and is an ancestor
-  of `$BRANCH` when supplied. Use `jj_read` for jj inspection.
+- Anchor preflight verifies `$BRANCH` and `$TARGET` and resolves `$SOURCE`, when supplied,
+  to exactly one commit at the owned checkpoint before creating the anchor. The
+  resolved commit must exist in Git and be an ancestor of `$BRANCH`. Use `jj_read`
+  for diagnostic jj inspection, not Git parsing of the raw revset expression.
 - Preserve all foreign files. On unexpected state diagnose using Git no-optional-
   locks reads and pinned no-snapshot jj reads, never ordinary `jj status`.
 
@@ -299,6 +313,9 @@ PRE_TIP=$(jq -er .pre.PRE_TIP "$BUNDLE/state.json")
 # Operation-pinned before/after logs are produced by vr assemble.
 ```
 
+Before creating the anchor, the helper records every supplied SOURCE resolution,
+requires singleton/Git ancestry and revalidates the owned checkpoint after these
+reads. It freezes `SOURCE_COMMIT`, `SOURCE_OPERATION` and the parent-based `PRE_BASE`.
 The helper creates `refs/pre-rebase/$ATTEMPT_ID` with an expected-absent CAS.
 It never overwrites another attempt's anchor, even for the same branch.
 
@@ -357,7 +374,7 @@ vr rebase
 ```
 
 The helper executes the existing `jj --ignore-working-copy --config
-'revset-aliases."immutable_heads()"="none()"' rebase -s "$SOURCE" -d "$NEW_TARGET"`
+'revset-aliases."immutable_heads()"="none()"' rebase -s "$SOURCE_COMMIT" -d "$NEW_TARGET"`
 or `rebase -b "$BRANCH" -d "$NEW_TARGET"` with the frozen inputs and target.
 Every jj mutation is pinned to the prior checkpoint operation and a fresh command
 UUID in operation metadata. At command return, the helper walks only attributable

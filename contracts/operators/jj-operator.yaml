@@ -59,7 +59,7 @@ inputs:
   type: string
   required: false
   default_source: caller
-  description: Optional verified-rebase SOURCE revision for scoped rebases.
+  description: 'Optional verified-rebase SOURCE: Git SHA or singleton jj revset, resolved at the owned pre-anchor checkpoint.'
 - name: parent_bundle
   type: path
   required: false
@@ -138,3 +138,4 @@ forbidden_direct:
 - same-operation-self-redispatch
 - in-checkout-rebase-evidence
 - unowned-substrate-reuse-or-cleanup
+- legacy-git-rebase-fallback

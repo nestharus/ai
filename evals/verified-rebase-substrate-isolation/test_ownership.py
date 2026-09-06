@@ -33,6 +33,10 @@ def capture(repo, args, **kwargs):
             return base64.b64encode(value.encode() if isinstance(value, str) else value).decode()
         (records / (str(uuid.uuid4()) + '.json')).write_text(json.dumps({
             'cwd': str(repo), 'args': list(args), 'returncode': result.returncode,
+            'environment': {k: kwargs.get('env', os.environ).get(k) for k in
+                ('PATH', 'HOME', 'GIT_CONFIG_GLOBAL', 'GIT_CONFIG_NOSYSTEM', 'JJ_CONFIG',
+                 'VR_HELPER', 'repo_root', 'planning_dir', 'OWNER_ID', 'ATTEMPT_ID', 'BRANCH', 'TARGET', 'SOURCE', 'PARENT_BUNDLE')},
+            'stdin_base64': data(kwargs['input']) if kwargs.get('input') is not None else None,
             'stdout_base64': data(result.stdout), 'stderr_base64': data(result.stderr)}))
     return result
 

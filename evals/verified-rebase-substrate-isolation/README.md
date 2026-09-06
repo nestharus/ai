@@ -35,6 +35,13 @@ The fixtures cover:
 - actual command-return/checkpoint barriers for anchor, fetch, rebase, rollback,
   and accepted divergent abandonment, with clean foreign jj operation/Git-ref
   interference and no-interference controls;
+- allocation-boundary unavailable-jj and Git-only/manual-checkout refusals through
+  the actual workflow shell, external diagnostics with no reservation or branch
+  mutation, full status/refs/remote equality, and restored supported-path control;
+- singleton jj change-ID/intersection expressions and full/abbreviated Git SHA
+  sources on stale-parent stacks, exact pre-anchor operation/commit binding,
+  invalid/empty/multiple/non-ancestor refusal before anchor/fetch/rebase,
+  repeated-refusal evidence preservation, and foreign-operation read barrier;
 - normal and text-conflict full workflow, no-op, scoped and unscoped stale-parent
   history, stacked parent/child cross-bundle associations, multi-parent basis
   collapse, rename, deletion and binary conflicts;
@@ -72,3 +79,7 @@ and caller must establish native same-operation completion separately; a helper
 exit or `topology_validation: operator-owned` is not that evidence. Source/config
 variants outside these fixtures are not claimed tested. Prompt-override WRITE
 evals remain specifications, not agent-tree experiments or semantic review.
+
+Input-boundary shell tests do not establish a live model's natural-language
+handling of manual-rebase instructions or caller replacement decisions. Those
+require separately authorized native actor evidence; no agent is spawned here.
