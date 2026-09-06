@@ -9530,6 +9530,166 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     }
 
 
+def _open_pr_head_repository_check():
+    operator = (REPO_ROOT / "agents/worktree-operator.md").read_text()
+    section = operator.split("### GraphQL head repository identity", 1)[1]
+    code = section.split("```python\n", 1)[1].split("```", 1)[0]
+    namespace = {}
+    exec(
+        compile(code, "agents/worktree-operator.md:head-repository", "exec"), namespace
+    )
+    return namespace["require_same_head_repository"]
+
+
+@pytest.fixture
+def split_head_repository_projection():
+    # gh pr view --json headRepository,headRepositoryOwner projection from #1298.
+    # Deliberately no nameWithOwner: do not replace this with a richer API shape.
+    return {
+        "headRepository": {"id": "R_kgDOOtFmdA", "name": "RFQautomation"},
+        "headRepositoryOwner": {"id": "O_kgDODmo5LQ", "login": "lama-ai-RFQ"},
+    }
+
+
+def test_worktree_open_pr_accepts_split_head_repository(
+    split_head_repository_projection,
+):
+    assert "nameWithOwner" not in split_head_repository_projection["headRepository"]
+    assert (
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+        == "lama-ai-RFQ/RFQautomation"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("headRepository", None),
+        ("headRepository", {}),
+        ("headRepository", {"name": "another-repo"}),
+        ("headRepository", {"name": ""}),
+        ("headRepository", {"name": None}),
+        ("headRepository", {"name": 1298}),
+        ("headRepository", {"name": "RFQautomation/extra"}),
+        ("headRepository", {"name": " RFQautomation"}),
+        ("headRepositoryOwner", None),
+        ("headRepositoryOwner", {}),
+        ("headRepositoryOwner", {"login": "another-owner"}),
+        ("headRepositoryOwner", {"login": ""}),
+        ("headRepositoryOwner", {"login": None}),
+        ("headRepositoryOwner", {"login": 1298}),
+        ("headRepositoryOwner", {"login": "lama-ai-RFQ/extra"}),
+        ("headRepositoryOwner", {"login": "lama-ai-RFQ\n"}),
+    ],
+)
+def test_worktree_open_pr_rejects_invalid_split_head_repository(
+    split_head_repository_projection, field, value
+):
+    split_head_repository_projection[field] = value
+    with pytest.raises(ValueError):
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+
+
+@pytest.mark.parametrize("field", ["headRepository", "headRepositoryOwner"])
+def test_worktree_open_pr_rejects_absent_split_field(
+    split_head_repository_projection, field
+):
+    del split_head_repository_projection[field]
+    with pytest.raises(ValueError):
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+
+
+@pytest.mark.parametrize("combined", [None, "", "other/repo", 1298])
+def test_worktree_open_pr_rejects_conflicting_combined_identity(
+    split_head_repository_projection, combined
+):
+    split_head_repository_projection["headRepository"]["nameWithOwner"] = combined
+    with pytest.raises(ValueError):
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+
+
+def test_worktree_open_pr_accepts_consistent_combined_identity(
+    split_head_repository_projection,
+):
+    split_head_repository_projection["headRepository"]["nameWithOwner"] = (
+        "lama-ai-RFQ/RFQautomation"
+    )
+    assert (
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+        == "lama-ai-RFQ/RFQautomation"
+    )
+
+
+@pytest.mark.parametrize(
+    "field,key", [("headRepository", "name"), ("headRepositoryOwner", "login")]
+)
+def test_worktree_open_pr_combined_identity_cannot_replace_split_fields(
+    split_head_repository_projection, field, key
+):
+    split_head_repository_projection["headRepository"]["nameWithOwner"] = (
+        "lama-ai-RFQ/RFQautomation"
+    )
+    del split_head_repository_projection[field][key]
+    with pytest.raises(ValueError):
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "lama-ai-RFQ/RFQautomation"
+        )
+
+
+def test_worktree_open_pr_rejects_different_target_repository(
+    split_head_repository_projection,
+):
+    with pytest.raises(ValueError, match="head repository mismatch"):
+        _open_pr_head_repository_check()(
+            split_head_repository_projection, "another-owner/RFQautomation"
+        )
+
+
+def test_worktree_open_pr_split_identity_contract_preserves_readback_and_reconciliation():
+    operator = (REPO_ROOT / "agents/worktree-operator.md").read_text()
+    section = operator.split("## Procedure: Open PR", 1)[1].split(
+        "## Result Contract", 1
+    )[0]
+    assert "Do not require `headRepository.nameWithOwner`" in section
+    assert "Require `headRepository.nameWithOwner` and" not in section
+    assert "both list and view responses" in section
+    for requirement in (
+        "BLOCKED:ambiguous-open-pr",
+        "BLOCKED:non-exact-open-pr",
+        'gh api "repos/$repo_slug/pulls/$pr_number"',
+        "base.repo.full_name",
+        "head.repo.full_name",
+        "base.ref",
+        "head.ref",
+        "base.sha",
+        "head.sha",
+        "html_url",
+        "number",
+        "state=open",
+        "draft=true",
+        "title",
+        "body",
+        "exact writer output",
+        "reused PR's captured title/body",
+        'gh pr close "$created_pr_url" --repo "$repo_slug"',
+        "exact re-query succeeds with `state=CLOSED`",
+    ):
+        assert requirement in section
+    sidecar = _load_yaml("contracts/operators/worktree-operator.yaml")
+    embedded = _fenced_yaml_section("agents/worktree-operator.md", "## Contract")
+    assert sidecar["outputs"] == embedded["outputs"]
+
+
 def test_build_prototype_indexes_complete_test_carry_forward_schema():
     fields = (
         "prototype_test_pr_url",

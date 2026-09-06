@@ -70,7 +70,7 @@ outputs:
   success_shape: 'worktree-operation-result-v1 with task=bulk-cleanup and one worktree_path/branch/base branch/base SHA/head SHA/cleanliness/PR target repository/PR head repository/PR URL/number/state/removed/status/reason row per inspected target; skipped rows retain every key and use null for unavailable identity fields; aggregate status is PASS for zero or all-PASS rows, PARTIAL for mixed PASS/BLOCKED rows, and BLOCKED for non-empty all-BLOCKED rows.'
   wrote_lines: []
 - task: open-pr
-  success_shape: 'worktree-operation-result-v1 with task=open-pr, status=PASS, provider_state=OPEN, exact target and head repository identities, PR URL/number, base/head branches, base SHA, head SHA, and draft=true.'
+  success_shape: 'worktree-operation-result-v1 with task=open-pr, status=PASS, provider_state=OPEN, exact target and head repository identities, PR URL/number, base/head branches, base SHA, head SHA, and draft=true. GraphQL head identity uses headRepositoryOwner.login plus headRepository.name; absent nameWithOwner is allowed. Exact REST readback remains required.'
   wrote_lines: []
 errors:
 - class: BLOCKED

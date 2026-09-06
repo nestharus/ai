@@ -75,7 +75,7 @@ outputs:
     success_shape: "worktree-operation-result-v1 with task=bulk-cleanup and one worktree_path/branch/base branch/base SHA/head SHA/cleanliness/PR target repository/PR head repository/PR URL/number/state/removed/status/reason row per inspected target; skipped rows retain every key and use null for unavailable identity fields; aggregate status is PASS for zero or all-PASS rows, PARTIAL for mixed PASS/BLOCKED rows, and BLOCKED for non-empty all-BLOCKED rows."
     wrote_lines: []
   - task: open-pr
-    success_shape: "worktree-operation-result-v1 with task=open-pr, status=PASS, provider_state=OPEN, exact target and head repository identities, PR URL/number, base/head branches, base SHA, head SHA, and draft=true."
+    success_shape: "worktree-operation-result-v1 with task=open-pr, status=PASS, provider_state=OPEN, exact target and head repository identities, PR URL/number, base/head branches, base SHA, head SHA, and draft=true. GraphQL head identity uses headRepositoryOwner.login plus headRepository.name; absent nameWithOwner is allowed. Exact REST readback remains required."
     wrote_lines: []
 errors:
   - class: BLOCKED
@@ -213,7 +213,7 @@ Keep the mutation lock held through this command and the post-removal filesystem
 
 In this procedure, `push_url` is the exact validated push URL returned for `push_remote`; remote-head reads use this URL directly and never resolve the remote's potentially different fetch URL.
 
-After creating a worktree and making commits, resolve and validate `repo_slug` as the exact `OWNER/REPO` identity of `${repo_root}`. Set `push_remote=origin`, read its push URL with `git -C "$repo_root" remote get-url --push "$push_remote"`, normalize only supported GitHub SSH/HTTPS URL forms to `OWNER/REPO`, and require that identity to equal `repo_slug`; otherwise return `BLOCKED:push-remote-repository-mismatch` before any fetch, push, or PR mutation. Acquire the same exclusive advisory mutation lock under the canonical Git common directory used by `sync` before resolving worktree or ref identities, and hold it through the exact open-PR decision, writer result, push, remote-head verification, PR creation or reuse, provider verification, and any owned-PR reconciliation. While holding it, require the worktree's current branch to equal `branch_name`; fetch `base_branch`, set `base_ref` to the exact remote-tracking ref, resolve `base_sha`, set `head_ref` to the exact local branch ref, and resolve `head_sha`. Immediately before the provider query, re-read the current branch, `base_ref`, and `head_ref` and require exact equality with `branch_name`, `base_sha`, and `head_sha`; any change is `BLOCKED:stale-open-pr-worktree-identity`. Then, while still holding the lock and before any push, query open PRs with `gh pr list --repo "$repo_slug" --state open --head "$branch_name" --base "$base_branch" --json url,number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner` and capture the exact target/head repository identities, base/head branch pair, URL, number, state, draft flag, and full OIDs. Require `headRepository.nameWithOwner` and the owner/name reconstructed from `headRepositoryOwner.login` plus `headRepository.name` to equal `repo_slug`. More than one match is `BLOCKED:ambiguous-open-pr`. If one PR exists and every required provider field matches the repository, local, and base identities, reuse it without invoking `pr-writer`, pushing, or creating another PR. If one PR exists and any required field differs, return `BLOCKED:non-exact-open-pr` with its observed identity; do not invoke `pr-writer`, push, or call `gh pr create`. Only zero open query results enter the creation path. In that path, dispatch `pr-writer` and require successful, non-empty title and body output before the first push:
+After creating a worktree and making commits, resolve and validate `repo_slug` as the exact `OWNER/REPO` identity of `${repo_root}`. Set `push_remote=origin`, read its push URL with `git -C "$repo_root" remote get-url --push "$push_remote"`, normalize only supported GitHub SSH/HTTPS URL forms to `OWNER/REPO`, and require that identity to equal `repo_slug`; otherwise return `BLOCKED:push-remote-repository-mismatch` before any fetch, push, or PR mutation. Acquire the same exclusive advisory mutation lock under the canonical Git common directory used by `sync` before resolving worktree or ref identities, and hold it through the exact open-PR decision, writer result, push, remote-head verification, PR creation or reuse, provider verification, and any owned-PR reconciliation. While holding it, require the worktree's current branch to equal `branch_name`; fetch `base_branch`, set `base_ref` to the exact remote-tracking ref, resolve `base_sha`, set `head_ref` to the exact local branch ref, and resolve `head_sha`. Immediately before the provider query, re-read the current branch, `base_ref`, and `head_ref` and require exact equality with `branch_name`, `base_sha`, and `head_sha`; any change is `BLOCKED:stale-open-pr-worktree-identity`. Then, while still holding the lock and before any push, query open PRs with `gh pr list --repo "$repo_slug" --state open --head "$branch_name" --base "$base_branch" --json url,number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner` and capture the exact target/head repository identities, base/head branch pair, URL, number, state, draft flag, and full OIDs. Apply the GraphQL head repository identity check below: reconstruct `OWNER/REPO` from `headRepositoryOwner.login` plus `headRepository.name` and require exact equality with `repo_slug`. More than one match is `BLOCKED:ambiguous-open-pr`. If one PR exists and every required provider field matches the repository, local, and base identities, reuse it without invoking `pr-writer`, pushing, or creating another PR. If one PR exists and any required field differs, return `BLOCKED:non-exact-open-pr` with its observed identity; do not invoke `pr-writer`, push, or call `gh pr create`. Only zero open query results enter the creation path. In that path, dispatch `pr-writer` and require successful, non-empty title and body output before the first push:
 
 ```bash
 # Keep writer output outside the untrusted worktree and private to this invocation.
@@ -263,7 +263,39 @@ Before the push, require the writer command to succeed and both `$writer_dir/pr-
 
 For a reused or newly created PR, query that exact captured URL/number from `repo_slug` and require `state=OPEN`, `draft=true`, the requested base/head branches, provider base OID equal to the captured `base_sha`, and provider head OID equal to the captured `head_sha`, then return that provider identity. If `create_rc` is nonzero or `created_pr_output` is empty, malformed, or not one usable URL, perform one bounded exact repository/base/head `--state all` requery for diagnostic evidence only. The requery cannot prove which actor created a discovered PR, even under the local mutation lock. Do not close any PR from that evidence; return `BLOCKED` with `mutation_state=unknown` and all observed candidates. Never report success from unusable create output.
 
+Before success for either creation or reuse, also perform exact REST readback with `gh api "repos/$repo_slug/pulls/$pr_number"`. Require `base.repo.full_name` and `head.repo.full_name` to equal `repo_slug`; `base.ref`/`head.ref` and `base.sha`/`head.sha` to equal the captured branch names and OIDs; `state=open`, `draft=true`, and `html_url`/`number` to equal the exact captured PR URL/number. Require `title` and `body` to equal the exact writer output for creation, or the reused PR's captured title/body for reuse (capture those before its final readback). Missing, malformed, or differing fields and failed REST queries block success; the GraphQL split-field check does not replace REST readback or prove target repository identity by itself.
+
 If a newly created PR with a usable URL fails any postcondition, run `gh pr close "$created_pr_url" --repo "$repo_slug" --comment "Closed automatically after open-pr postcondition verification failed."` and re-query that exact PR. Use `mutation_state=reconciled` only when the close succeeds and the exact re-query succeeds with `state=CLOSED`; include a machine-readable `reconciliation` object containing the close result and closed provider identity. If close fails, re-query fails, or the exact PR remains open, return `BLOCKED` with `mutation_state=unknown` and the last observed identity. Never leave an identified unverified open PR or report success as though reconciliation completed. If a reused PR fails verification, leave it unchanged and return `BLOCKED` with `mutation_state=none` and its observed identity. A retry re-runs the exact open-PR query and reuses a valid exact match rather than creating another PR.
+
+### GraphQL head repository identity
+
+Use this check for both list and view responses in this open-PR procedure, including post-create verification and reconciliation readback. The selected `gh pr ... --json headRepository,headRepositoryOwner` projection supplies `headRepository.name` and `headRepositoryOwner.login`. Do not require `headRepository.nameWithOwner`: its absence is valid for this projection. If present, it must agree with the split identity. Missing or malformed owner/name must still block even if a combined field is present; never substitute the requested repository or infer the head owner from the target URL. Catch `ValueError` as a failed identity postcondition and follow the creation/reuse reconciliation rules above, not an uncaught exit.
+
+```python
+import re
+
+
+def require_same_head_repository(provider, repo_slug):
+    """Parser: validate the selected GraphQL projection, returning exact OWNER/REPO."""
+    if not isinstance(provider, dict):
+        raise ValueError("malformed PR identity")
+    repository = provider.get("headRepository")
+    owner = provider.get("headRepositoryOwner")
+    if not isinstance(repository, dict) or not isinstance(owner, dict):
+        raise ValueError("missing head repository or owner")
+    name = repository.get("name")
+    login = owner.get("login")
+    if not isinstance(name, str) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+        raise ValueError("missing or malformed head repository name")
+    if not isinstance(login, str) or not re.fullmatch(r"[A-Za-z0-9]+(?:-[A-Za-z0-9]+)*", login):
+        raise ValueError("missing or malformed head repository owner")
+    identity = f"{login}/{name}"
+    if identity != repo_slug:
+        raise ValueError("head repository mismatch")
+    if "nameWithOwner" in repository and repository["nameWithOwner"] != identity:
+        raise ValueError("inconsistent combined head repository identity")
+    return identity
+```
 
 ## Result Contract
 
