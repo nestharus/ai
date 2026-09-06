@@ -45,12 +45,36 @@ inputs:
   required: false
   default_source: caller
   description: branch policy
+- name: lock_acquire_seconds
+  type: integer
+  required: false
+  default_source: base
+  description: Positive integer seconds, at most 300, for acquiring the canonical worktree-operator.lock; expiry is BLOCKED:mutation-lock-timeout with no mutation.
+- name: lock_hold_seconds
+  type: integer
+  required: false
+  default_source: base
+  description: Positive integer seconds, at most 3600, for each synchronous mechanical critical section; never spans pr-writer.
+- name: lock_cleanup_seconds
+  type: integer
+  required: false
+  default_source: base
+  description: Positive integer seconds, at most 60, for TERM-to-KILL escalation and verified owned-tree retirement; must cover the installed runtime cancellation grace.
 defaults:
 - name: worktrees_root
   value: ${repo_root}/worktrees
   source: base
 - name: base_branch
   value: main
+  source: base
+- name: lock_acquire_seconds
+  value: 30
+  source: base
+- name: lock_hold_seconds
+  value: 300
+  source: base
+- name: lock_cleanup_seconds
+  value: 10
   source: base
 secrets: []
 outputs:
@@ -79,6 +103,9 @@ errors:
 - class: NEEDS_INPUT
   cause: A user-owned value, scope, or trade-off question is required.
   recovery: Answer the emitted question artifact and resume.
+- class: BLOCKED
+  cause: Mutation lock acquisition, execution, cancellation, or retirement is unverified; use mutation-lock-timeout, mutation-lock-deadline, mutation-lock-interrupted, or mutation-lock-cleanup-unverified.
+  recovery: Prove the exact prior attempt terminal before retry; unknown external outcomes require reconciliation.
 side_effects:
 - git-fetch
 - git-worktree-create
@@ -99,3 +126,9 @@ forbidden_direct:
 - unquoted-caller-controlled-git-arguments
 - worktree-target-outside-canonical-root
 - central-checkout-as-worktree-target
+- async-lock-holder-or-waiter
+- marker-or-sleep-lock-lifetime
+- unbounded-lock-acquisition
+- lock-across-pr-writer
+- unlock-before-owned-tree-retirement
+- unlink-or-replace-mutation-lock

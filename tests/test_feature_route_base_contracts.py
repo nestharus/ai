@@ -9351,7 +9351,7 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     assert "this operator has no force-removal input" in operator
     assert "Require exactly one provider PR" in operator
     assert 'writer_dir=$(mktemp -d)' in operator
-    assert 'trap \'rm -rf -- "$writer_dir"\' EXIT' in operator
+    assert "Cleanup `writer_dir` only after the writer is terminal" in operator
     assert 'tee "$writer_dir/pr-writer.log"' in operator
     assert "$worktree_path/.tmp" not in operator
     assert "not be symlinks" in operator
@@ -9383,7 +9383,17 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     assert 'git ls-remote --exit-code --refs "$push_url"' in operator
     assert "BLOCKED:remote-head-unverified" in operator
     assert "whose OID equals `head_sha`" in operator
-    assert "hold it through the exact open-PR decision" in operator
+    assert "hold it through the exact open-PR decision only (section A)" in operator
+    assert "Release section A and prove its owned tree terminal" in operator
+    assert "### Section B: reacquire and revalidate" in operator
+    assert "Only an unchanged tuple and zero" in operator
+    for limit, value in (("lock_acquire_seconds", 30), ("lock_hold_seconds", 300), ("lock_cleanup_seconds", 10)):
+        assert next(row["value"] for row in sidecar["defaults"] if row["name"] == limit) == value
+    for forbidden in ("async-lock-holder-or-waiter", "marker-or-sleep-lock-lifetime", "unbounded-lock-acquisition", "lock-across-pr-writer", "unlock-before-owned-tree-retirement"):
+        assert forbidden in sidecar["forbidden_direct"]
+    embedded = _fenced_yaml_section("agents/worktree-operator.md", "## Contract")
+    for field in ("inputs", "defaults", "outputs", "errors", "forbidden_direct"):
+        assert embedded[field] == sidecar[field]
     assert "before resolving worktree or ref identities" in operator
     assert "BLOCKED:stale-open-pr-worktree-identity" in operator
     assert "REGISTERED_PRIMARY" in operator
@@ -9521,7 +9531,8 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     create_index = open_pr_section.index("created_pr_output=$(gh pr create")
     assert lock_index < resolve_index < query_index < non_exact_index < writer_index
     assert stale_identity_index < push_index < create_index
-    assert writer_index < push_index < remote_head_index < create_index
+    revalidate_index = open_pr_section.index("# worktree-publication-dispatch-v1")
+    assert writer_index < revalidate_index < push_index < remote_head_index < create_index
     assert variants["bulk-cleanup"]["aggregate_status"] == {
         "zero_targets": "PASS",
         "all_rows_pass": "PASS",
