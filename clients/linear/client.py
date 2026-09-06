@@ -131,6 +131,31 @@ def _validate_search_issue_identity(node: Any) -> None:
         )
 
 
+def _validate_comment_page(issue: Any) -> None:
+    """Require readable matching facts and explicit completion before aggregation."""
+    if not isinstance(issue, dict) or any(
+        not isinstance(issue.get(field), str) or not issue[field].strip()
+        for field in ("id", "identifier")
+    ):
+        raise LinearClientError("INVALID_RESPONSE", "Linear comment page requires issue identity")
+    comments = issue.get("comments")
+    if not isinstance(comments, dict) or not isinstance(comments.get("nodes"), list):
+        raise LinearClientError("INVALID_RESPONSE", "Linear comment page requires comments.nodes as a list")
+    page_info = comments.get("pageInfo")
+    if not isinstance(page_info, dict) or not isinstance(page_info.get("hasNextPage"), bool):
+        raise LinearClientError("INVALID_RESPONSE", "Linear comment page requires boolean pageInfo.hasNextPage")
+    for node in comments["nodes"]:
+        if (
+            not isinstance(node, dict)
+            or not isinstance(node.get("id"), str)
+            or not node["id"].strip()
+            or not isinstance(node.get("body"), str)
+        ):
+            raise LinearClientError("INVALID_RESPONSE", "Linear comment requires a non-blank ID and string body")
+        if node.get("user") is not None and not isinstance(node["user"], dict):
+            raise LinearClientError("INVALID_RESPONSE", "Linear comment user must be an object or null")
+
+
 class LinearClient:
     """Python client for the Linear GraphQL API.
 
@@ -453,9 +478,14 @@ query($issueId: String!) {
 """
         variables = {"issueId": issue_id}
         result = self._run_graphql(query, variables)
-        issue = result.get("data", {}).get("issue")
-        if not issue:
+        data = result.get("data")
+        if not isinstance(data, dict):
+            raise LinearClientError("INVALID_RESPONSE", "Linear issue response requires data as an object")
+        issue = data.get("issue")
+        if issue is None:
             raise LinearClientError("NOT_FOUND", f"Issue not found: {issue_id}")
+        if not isinstance(issue, dict):
+            raise LinearClientError("INVALID_RESPONSE", "Linear issue response must be an object")
 
         if "project" not in issue:
             raise LinearClientError(
@@ -812,6 +842,7 @@ mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
         """
         all_comments: list[dict[str, Any]] = []
         cursor: str | None = None
+        seen_cursors: set[str] = set()
         issue_uuid: str | None = None
         issue_identifier: str | None = None
 
@@ -846,17 +877,36 @@ query IssueComments($id: String!, $after: String) {
                 variables["after"] = cursor
 
             result = self._run_graphql(query, variables)
-            issue = result.get("data", {}).get("issue")
-            if not issue:
+            data = result.get("data")
+            if not isinstance(data, dict):
+                raise LinearClientError("INVALID_RESPONSE", "Linear comment response requires data as an object")
+            issue = data.get("issue")
+            if issue is None:
                 raise LinearClientError("NOT_FOUND", f"Issue not found: {issue_id}")
+            _validate_comment_page(issue)
 
-            # Capture issue UUID and identifier on first iteration
+            # Bind the first page to the request, then retain the same identity.
             if issue_uuid is None:
-                issue_uuid = issue.get("id")
-                issue_identifier = issue.get("identifier")
+                if issue_id.strip().casefold() not in {
+                    issue["id"].strip().casefold(), issue["identifier"].strip().casefold()
+                }:
+                    raise LinearClientError("INVALID_RESPONSE", "Linear comment page belongs to another issue")
+                issue_uuid = issue["id"]
+                issue_identifier = issue["identifier"]
+            elif (issue["id"], issue["identifier"]) != (issue_uuid, issue_identifier):
+                raise LinearClientError("INVALID_RESPONSE", "Linear comment page issue identity changed")
 
-            comments_data = issue.get("comments") or {}
-            nodes = comments_data.get("nodes", [])
+            comments_data = issue["comments"]
+            nodes = comments_data["nodes"]
+            page_info = comments_data["pageInfo"]
+            next_cursor = page_info.get("endCursor")
+            if page_info["hasNextPage"] and (
+                not isinstance(next_cursor, str) or not next_cursor.strip() or next_cursor in seen_cursors
+            ):
+                raise LinearClientError(
+                    "PAGINATION_ERROR",
+                    "Pagination did not advance: missing or revisited endCursor",
+                )
 
             for node in nodes:
                 user_data = node.get("user")
@@ -877,15 +927,9 @@ query IssueComments($id: String!, $after: String) {
                     }
                 )
 
-            page_info = comments_data.get("pageInfo", {})
-            next_cursor = page_info.get("endCursor")
-            if not page_info.get("hasNextPage"):
+            if not page_info["hasNextPage"]:
                 break
-            if not next_cursor or next_cursor == cursor:
-                raise LinearClientError(
-                    "PAGINATION_ERROR",
-                    "Pagination did not advance: missing or repeated endCursor",
-                )
+            seen_cursors.add(next_cursor)
             cursor = next_cursor
 
         return {

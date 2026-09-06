@@ -15,12 +15,18 @@ def _single_team(client: LinearClient, team_key: str) -> str:
 
 
 def _exact_candidate(issue: dict, candidate_id: str, title: str, team_id: str, project_id: str | None) -> bool:
-    if issue.get("id") != candidate_id or not issue.get("identifier") or not issue.get("url"):
+    if not isinstance(issue, dict) or any(
+        not isinstance(issue.get(field), str) or not issue[field].strip()
+        for field in ("id", "identifier", "title", "url")
+    ) or issue["id"] != candidate_id:
         raise LinearClientError("INVALID_RESPONSE", "Duplicate candidate identity is incomplete or changed")
-    if not isinstance(issue.get("team"), dict) or not issue["team"].get("id") or "project" not in issue:
+    team = issue.get("team")
+    if not isinstance(team, dict) or not isinstance(team.get("id"), str) or not team["id"].strip() or "project" not in issue:
         raise LinearClientError("INVALID_RESPONSE", "Duplicate candidate scope is missing")
     project = issue["project"]
-    if project is not None and (not isinstance(project, dict) or not project.get("id")):
+    if project is not None and (
+        not isinstance(project, dict) or not isinstance(project.get("id"), str) or not project["id"].strip()
+    ):
         raise LinearClientError("INVALID_RESPONSE", "Duplicate candidate project is malformed")
     return (
         issue.get("title") == title
