@@ -293,32 +293,18 @@ estimate_field: "estimate"
 
 Then the markdown body is the issue description verbatim (Linear stores Markdown natively, no rendering step). Do not transform headings, lists, or code blocks. `story_point_estimate` comes from the Linear `estimate` field. `estimate_source` and `estimate_rationale` are parsed from description labels such as `Estimate Source` and `Estimate Rationale`; use `missing` and `null` when absent. `estimate_field: "estimate"` identifies the mutation target for later refinement. `labels:` must come from the real `get-issue` `labels` data, and project readback may include `project.slugId` and project teams. The orchestrator validates only that the rendered description is non-empty.
 
-Implementation:
+Implementation (the captured envelope is supplied on stdin; the destination is a real argv value):
 
 ```bash
-ISSUE_JSON=$(PYTHONPATH=$HOME/ai python3 -m clients.linear.cli get-issue "${ISSUE_KEY}")
-python3 -c "
-import json, os, sys
-env = json.loads(os.environ['ISSUE_JSON'])
-if not env.get('ok'): sys.exit(2)
-d = env['data']
-fm = ['---',
-  f\"key: {d.get('identifier','')}\",
-  f\"summary: {d.get('title','')}\",
-  f\"status: {(d.get('state') or {}).get('name','')}\",
-  f\"parent: {(d.get('parent') or {}).get('identifier','')}\",
-  f\"labels: {[lbl.get('name','') for lbl in (d.get('labels') or [])]}\",
-  f\"url: {d.get('url','')}\",
-  f\"story_point_estimate: {d.get('estimate') if d.get('estimate') is not None else 'null'}\",
-  \"estimate_source: missing\",
-  \"estimate_rationale: null\",
-  \"estimate_field: \\\"estimate\\\"\",
-  '---', '']
-with open(os.environ['OUTPUT_PATH'], 'w') as f:
-    f.write('\n'.join(fm))
-    f.write(d.get('description') or '')
-" ISSUE_JSON="$ISSUE_JSON" OUTPUT_PATH="$output_path"
+if ISSUE_JSON=$(PYTHONPATH=$HOME/ai python3 -m clients.linear.cli get-issue "${issue_key}"); then
+    printf '%s' "$ISSUE_JSON" | PYTHONPATH=$HOME/ai python3 -m clients.linear.ticket_bootstrap "${output_path}"
+else
+    printf '%s\n' 'BLOCKED:ticket-read: get-issue failed' >&2
+    exit 2
+fi
 ```
+
+Require the renderer's exit status to be zero before using the artifact; on failure, return `BLOCKED` and never consume an earlier output file. The renderer serializes metadata with `yaml.safe_dump` and writes the description's exact UTF-8 bytes after the closing frontmatter delimiter. It recognizes plain or bold `Estimate Source:` / `Estimate Rationale:` lines, optionally list-prefixed, outside fenced code. Absent labels alone use `missing` / `null`. Identical repeated labels are accepted; empty/conflicting labels or a source outside `prototype-dossier`, `layer-2-magnitude`, `layer-3-slice`, `backstop-spike`, `missing` return `BLOCKED` with the encountered values. Retain the original readback and resolve that uncertainty before bootstrap continues; never replace unknown provenance with an invented baseline.
 
 ## Procedure: Update Estimate
 
@@ -358,7 +344,7 @@ PYTHONPATH=$HOME/ai python3 -m clients.linear.estimate_admission \
     create-comment "${issue_key}" --body "${refinement_note}"
 ```
 
-When using the existing idempotent note path, replace only the command after `--` with `upsert-comment "${issue_key}" --title "Estimate refinement" --body "${refinement_note}"`; retain the same governing definition, guard, and result branches. If the note fails, return `BLOCKED` for the note stage and report the retained numeric success separately; do not claim rollback or a successful note. Return task success only after both stages succeed. This task does not transition status/state.
+When using the existing idempotent note path, the full `refinement_note` must start with `## Estimate refinement` followed by a newline and retain that first line on every update. Then replace only the command after `--` with `upsert-comment "${issue_key}" --title "Estimate refinement" --body "${refinement_note}"`; retain the same governing definition, guard, and result branches. If the note fails, return `BLOCKED` for the note stage and report the retained numeric success separately; do not claim rollback or a successful note. Return task success only after both stages succeed. This task does not transition status/state.
 
 ## Procedure: Comment
 
@@ -385,10 +371,10 @@ For idempotent commenting (e.g., orchestrator Phase 9 cross-link, where re-runni
 PYTHONPATH=$HOME/ai python3 -m clients.linear.cli upsert-comment \
     "AGE-34" \
     --title "PR Cross-link" \
-    --body "PR #123 opened: https://github.com/owner/repo/pull/123"
+    --body $'## PR Cross-link\n\nPR #123 opened: https://github.com/owner/repo/pull/123'
 ```
 
-`upsert-comment` matches by the `--title` value (it scans existing comments for that title in their body and updates in place if found).
+`upsert-comment` compares `--title` with only the first body line, normalizing both by trimming surrounding whitespace, removing leading `#` characters, then trimming again. The full body must retain that matching first line on both creation and update; the client writes the supplied body unchanged and does not insert a title. This applies to every `task=upsert-comment`, including estimate refinement and calibration notes. Ordinary `create-comment` and exact-body `comment-readback` do not add this heading.
 For `upsert-comment`: print the comment ID returned by the CLI JSON envelope so callers can record the durable reference.
 
 ### Producer-Authenticated Comment Readback
@@ -435,15 +421,16 @@ The producer log uses exactly `schema`, `backend`, `ticket_key`, `operation`, `s
 
 Used by `~/ai/agents/implementation-pipeline-orchestrator.md` Phase 0 when cold-starting from a `brief_path`, and by any operator workflow that needs to file a new issue.
 
+First complete duplicate reconciliation below. Only its zero-candidate outcome permits this single create invocation. Use its resolved `project_id` (or empty when no project was selected) as `resolved_project_id`:
+
 ```bash
-PYTHONPATH=$HOME/ai python3 -m clients.linear.cli create-issue \
-    --team "${linear_team_key}" \
-    --title "WU summary line" \
-    --description-file "${brief_path}" \
-    ${linear_project_id:+--project "${linear_project_id}"} \
-    ${labels:+--label "${labels}"} \
-    ${estimate:+--estimate "${estimate}"} \  # optional; story-point estimate
-    ${create_missing_labels:+--create-missing-labels}
+create_args=(--team "${linear_team_key}" --title "${summary}" --description-file "${brief_path}")
+if [[ -n "${resolved_project_id:-}" ]]; then create_args+=(--project "$resolved_project_id"); fi
+if [[ -n "${labels:-}" ]]; then create_args+=(--label "$labels"); fi
+# Optional story-point estimate and explicit missing-label creation.
+if [[ -n "${estimate:-}" ]]; then create_args+=(--estimate "$estimate"); fi
+if [[ "${create_missing_labels:-false}" == true ]]; then create_args+=(--create-missing-labels); fi
+PYTHONPATH=$HOME/ai python3 -m clients.linear.cli create-issue "${create_args[@]}"
 ```
 
 For a concrete story-point value, the optional flag is `--estimate 5` (`--estimate <int>` in templates).
@@ -471,14 +458,28 @@ The comparison permits only Linear's observed Markdown canonicalization: unorder
 
 **Description from a markdown brief.** The brief is sent without operator-authored transformation. Linear may canonicalize the two narrowly verified Markdown forms above; the operator does not synthesize scope or boundary sections from the brief.
 
-**Anti-pattern.** Do not file the same WU twice. Before creating, search for an existing issue with matching title:
+**Duplicate reconciliation before create.** Resolve the selected team key and optional project UUID/slugId, search that same scope, then require one exact case-sensitive full title and matching issue/team/project readback before reuse. Use the internal read-only helper, which calls the existing client's team/project resolution, project-filtered search, and `get-issue` paths:
 
 ```bash
-PYTHONPATH=$HOME/ai python3 -m clients.linear.cli search-issues --team-key "${linear_team_key}" --title-contains "WU summary line"
-# If found, return that key.
+PYTHONPATH=$HOME/ai python3 - "${linear_team_key}" "${summary}" "${linear_project_id:-}" <<'PY'
+import json, sys
+from clients.linear.client import LinearClient, LinearClientError
+from clients.linear.create_reconciliation import reconcile_create
+try:
+    result = reconcile_create(LinearClient(), sys.argv[1], sys.argv[2], sys.argv[3] or None)
+except LinearClientError as error:
+    print(json.dumps({"ok": False, "error": {"code": error.code, "message": str(error)}}))
+    raise SystemExit(2)
+print(json.dumps({"ok": True, "data": result}))
+PY
 ```
 
-If a duplicate is found, return the existing key instead of creating a new one. The orchestrator treats a returned existing-key as success.
+Check exit zero and exact `ok: true` before proceeding. Keep the returned `team_id` and `project_id` for this operation. The search includes archived issues and requests 100 candidates; because the existing search has no continuation cursor, a full page returns `AMBIGUOUS_ISSUE` instead of claiming uniqueness. Missing/invalid scope, unreadable candidates, or multiple exact candidates block with no create and no successful reuse. Substring/case-only matches are not exact duplicates. When no project was selected, the selected team is the whole search scope; do not invent a project restriction.
+
+- `data.issue` is null: create at most once in that resolved scope, then perform the required description verification.
+- `data.issue` is one exact candidate: retain its identifier and URL, create nothing, and run the same required `verify-issue-description` against that identifier and the original brief. Report successful reuse only after `MATCH`.
+
+A description mismatch or failed verification after either branch is `BLOCKED`; retain the candidate/created identity and do not make another create attempt. Reconciliation is a read-before-create check, not an atomic uniqueness guarantee against concurrent external creators.
 
 ## Procedure: List Projects
 
