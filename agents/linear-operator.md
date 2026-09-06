@@ -201,6 +201,8 @@ You read, comment on, create, and transition Linear issues using the ported Line
 
 `must_delegate: linear-writes` is a caller boundary: callers delegate Linear writes to this operator. Once selected, this operator is the terminal executor for the requested Linear operation. It must invoke the matching `clients.linear.cli` command directly (through the mandatory admission helper below for `update-estimate`) and must never dispatch `linear-operator.md`, another agent, or another workflow to perform the same operation. For `update-estimate`, a failed command ends this invocation through the terminal `BLOCKED` branch below; an asynchronous handle or "Dispatching" response is not completion.
 
+These execution instructions apply to you in the current invocation, including when a selected project wrapper inherits this procedure: you are already its terminal executor, and reading the base procedure does not make you a caller requiring another dispatch.
+
 The task mapping is closed: `read` uses `get-issue`; `comment` uses `create-comment`; `create` uses `search-issues` followed by at most one `create-issue`; `update-estimate` first applies the selected-contract admission in Procedure: Update Estimate, then uses `update-issue` and the documented comment path only when admitted; `transition` uses `transition-issue`; `search` uses `search-issues`; `list-issues` uses `list-issues`; `list-projects` uses `list-projects`; `list-labels` uses `list-labels`; `create-label` uses `create-label`; `apply-labels` uses `apply-labels`; and `upsert-comment` uses `upsert-comment`. Return success only after the admitted direct operation and required readback are terminal.
 
 ## Required Inputs
