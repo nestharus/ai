@@ -598,11 +598,12 @@ def main():
     print(json.dumps(result, sort_keys=True))
 
 
-try:
-    main()
-except (ValueError, OSError, subprocess.CalledProcessError) as error:
-    print("BLOCKED:" + str(error), file=sys.stderr)
-    sys.exit(1)
+if __name__ == "__main__":
+    try:
+        main()
+    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+        print("BLOCKED:" + str(error), file=sys.stderr)
+        sys.exit(1)
 ```
 
 Use this executable check on the observed writer pipeline statuses and files
@@ -621,13 +622,31 @@ for writer_file in "$writer_dir/pr-body.md" "$writer_dir/pr-body.md.title"; do
 done
 ```
 
-The section-B script defines `publish_new_pr` from the push/create/readback/
-reconciliation commands below and `verify_reused_pr` from the exact captured
-PR verification path. Load all mechanical identity arguments (including `worktree_path`, `push_url`,
-`base_sha` and `head_sha`) only from `publication_decision.identity`, never from
-unvalidated ambient shell variables. Both consume `publication_decision`; neither dispatches
-an agent. Use this gate to select exactly one mechanical path without releasing
-the lock or returning to the model between decision and mutation:
+The section-B script loads the following canonical functions, not model-authored
+replacements. Save the Python block below as `publication_effects_script`, and
+reserve a new private `publication_result_path` outside the worktree and writer
+directory. The script consumes **only** `publication_decision.identity` for
+mechanical repository/ref arguments. Its append-preserving journal records
+uncertainty **before** every external effect; retain it if interruption prevents
+a final output. Its `VERIFIED` is a mechanical observation, not an operator PASS:
+the caller still must prove section tree retirement and non-interruption.
+For section-A exact reuse, call the same `verify_reused_pr` function with the
+capture decision while section A is still locked; no writer is needed.
+
+```bash
+# worktree-publication-functions-v1
+publish_new_pr() {
+  printf '%s' "$publication_decision" | python3 "$publication_effects_script" \
+    create "$writer_dir" "$publication_result_path" "$publication_identity_script"
+}
+verify_reused_pr() {
+  printf '%s' "$publication_decision" | python3 "$publication_effects_script" \
+    reuse "" "$publication_result_path" "$publication_identity_script"
+}
+```
+
+Use this gate to select exactly one mechanical path without releasing the lock
+or returning to the model between decision and mutation:
 
 ```bash
 # worktree-publication-dispatch-v1
@@ -641,21 +660,178 @@ case "$publication_action" in
 esac
 ```
 
-```bash
-# Validate both writer files as non-empty before this first remote mutation.
-git -C "$worktree_path" push "$push_url" \
-  "refs/heads/$branch_name:refs/heads/$branch_name"
-remote_head_record=$(git ls-remote --exit-code --refs "$push_url" "refs/heads/$branch_name")
-# Require exactly one record whose ref is refs/heads/$branch_name and OID is head_sha.
+### Canonical publication effects and readback
 
-set +e
-created_pr_output=$(gh pr create --repo "$repo_slug" --draft \
-  --head "$branch_name" \
-  --base "$base_branch" \
-  --title "$(cat "$writer_dir/pr-body.md.title")" \
-  --body-file "$writer_dir/pr-body.md")
-create_rc=$?
-set -e
+This block owns push/create/reuse/reconciliation, including exact argv formation
+and verification. Do not replace it with action labels or rebuild its functions
+per invocation. Commands remain foreground children inheriting exclusion; the
+outer section deadline/owner cancellation bounds every command and diagnostic
+query. An interrupted journal is never permission to replay publication.
+
+```python
+# worktree-publication-effects-v1
+import json
+import os
+import pathlib
+import re
+import runpy
+import subprocess
+import sys
+
+FIELDS = "url,number,state,isDraft,baseRefName,baseRefOid,headRefName,headRefOid,headRepository,headRepositoryOwner"
+
+
+class Publication:
+    def __init__(self, selected, writer, journal, guard):
+        self.selected = selected
+        self.identity = selected["identity"]
+        self.writer = pathlib.Path(writer)
+        self.journal = pathlib.Path(journal)
+        self.validate_candidate = runpy.run_path(guard)["decision"]
+        self.state = dict(status="IN_PROGRESS", mutation_state="none", observed_identity=None,
+                          identity=self.identity, action=selected["action"], commands=[])
+        with self.journal.open("x") as output:
+            json.dump(self.state, output, sort_keys=True)
+
+    def record(self, **values):
+        self.state.update(values)
+        temporary = self.journal.with_suffix(self.journal.suffix + ".tmp")
+        with temporary.open("w") as output:
+            json.dump(self.state, output, sort_keys=True)
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(temporary, self.journal)
+
+    def command(self, *args):
+        self.record(in_flight=list(args))
+        result = subprocess.run(args, text=True, capture_output=True, close_fds=False)
+        observed = dict(argv=list(args), rc=result.returncode, stdout=result.stdout, stderr=result.stderr)
+        self.state["commands"].append(observed)
+        self.record(in_flight=None)
+        return observed
+
+    def blocked(self, reason, **values):
+        self.record(status="BLOCKED", reason=reason, **values)
+
+    def view(self, url):
+        result = self.command("gh", "pr", "view", url, "--repo", self.identity["repo_slug"], "--json", FIELDS)
+        if result["rc"] != 0:
+            return None
+        try:
+            return json.loads(result["stdout"])
+        except ValueError:
+            return None
+
+    def exact_url(self, row, url):
+        if not isinstance(row, dict):
+            return False
+        number = row.get("number")
+        return (type(number) is int and number > 0 and row.get("url") == url
+                and url == f'https://github.com/{self.identity["repo_slug"]}/pull/{number}')
+
+    def exact_open(self, row, url):
+        if not self.exact_url(row, url):
+            return False
+        try:
+            return self.validate_candidate(self.identity, [row])["action"] == "reuse"
+        except (ValueError, TypeError, AttributeError):
+            return False
+
+    def verified(self, row):
+        self.record(status="VERIFIED", observed_identity=row)
+
+    def writer_valid(self):
+        files = [self.writer / "pr-body.md", self.writer / "pr-body.md.title"]
+        return all(path.is_file() and not path.is_symlink() and path.stat().st_size > 0
+                   and path.resolve().parent == self.writer.resolve() for path in files)
+
+    def push(self):
+        identity = self.identity
+        self.record(mutation_state="unknown", phase="push")
+        result = self.command("git", "-C", identity["worktree_path"], "push", identity["push_url"],
+                              identity["head_ref"] + ":" + identity["head_ref"])
+        if result["rc"] != 0:
+            self.blocked("push-failed")
+            return False
+        remote = self.command("git", "ls-remote", "--exit-code", "--refs", identity["push_url"], identity["head_ref"])
+        if remote["rc"] != 0 or remote["stdout"].splitlines() != [identity["head_sha"] + "\t" + identity["head_ref"]]:
+            self.blocked("remote-head-unverified")
+            return False
+        return True
+
+    def create(self):
+        identity = self.identity
+        self.record(phase="create", mutation_state="unknown")
+        return self.command("gh", "pr", "create", "--repo", identity["repo_slug"], "--draft",
+                            "--head", identity["branch"], "--base", identity["base_branch"],
+                            "--title", (self.writer / "pr-body.md.title").read_text().rstrip("\n"),
+                            "--body-file", str(self.writer / "pr-body.md"))
+
+    def created_url(self, result):
+        url = result["stdout"].strip()
+        pattern = r"https://github\.com/" + re.escape(self.identity["repo_slug"]) + r"/pull/[1-9][0-9]*"
+        return url if result["rc"] == 0 and re.fullmatch(pattern, url) else None
+
+    def diagnose_create(self):
+        identity = self.identity
+        result = self.command("gh", "pr", "list", "--repo", identity["repo_slug"], "--state", "all",
+                              "--head", identity["branch"], "--base", identity["base_branch"], "--json", FIELDS)
+        self.blocked("create-outcome-unverified", diagnostic_candidates=result)
+
+    def reconcile(self, url, observed):
+        self.record(phase="close", observed_identity=observed, mutation_state="unknown")
+        closed = self.command("gh", "pr", "close", url, "--repo", self.identity["repo_slug"], "--comment",
+                              "Closed automatically after open-pr postcondition verification failed.")
+        row = self.view(url)
+        reconciled = closed["rc"] == 0 and self.exact_url(row, url) and row.get("state") == "CLOSED"
+        self.blocked("created-pr-postcondition-unverified", observed_identity=row,
+                     mutation_state="reconciled" if reconciled else "unknown",
+                     reconciliation=dict(close_result=closed, closed_provider_identity=row))
+
+    def publish_new_pr(self):
+        if not self.writer_valid():
+            self.blocked("pr-writer-output-invalid")
+            return
+        if not self.push():
+            return
+        url = self.created_url(self.create())
+        if url is None:
+            self.diagnose_create()
+            return
+        self.record(created_pr_url=url, phase="verify-created")
+        row = self.view(url)
+        if self.exact_open(row, url):
+            self.verified(row)
+            return
+        self.reconcile(url, row)
+
+    def verify_reused_pr(self):
+        url = self.selected["candidate"]["url"]
+        row = self.view(url)
+        if not self.exact_open(row, url):
+            self.blocked("reused-pr-postcondition-unverified", observed_identity=row)
+            return
+        self.verified(row)
+
+    def execute(self):
+        try:
+            {"create": self.publish_new_pr, "reuse": self.verify_reused_pr}[self.selected["action"]]()
+        except (ValueError, KeyError, TypeError, OSError) as error:
+            self.blocked("publication-command-error", error=str(error))
+        print(json.dumps(self.state, sort_keys=True))
+        return 0 if self.state["status"] == "VERIFIED" else 77
+
+
+def main():
+    action, writer, journal, guard = sys.argv[1:]
+    selected = json.load(sys.stdin)
+    if action not in ("create", "reuse") or selected["action"] != action:
+        raise ValueError("invalid-publication-action")
+    return Publication(selected, writer, journal, guard).execute()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
 ```
 
 Include `--input linear_issue_keys=<KEY>` only when a Linear key is known to the manual operator. Omit when no key is known; no close footer will be emitted in that case.
@@ -664,7 +840,7 @@ Before the push, require the writer command to succeed and both `$writer_dir/pr-
 
 For a reused or newly created PR, query that exact captured URL/number from `repo_slug` and require `state=OPEN`, `draft=true`, the requested base/head branches, provider base OID equal to the captured `base_sha`, and provider head OID equal to the captured `head_sha`, then return that provider identity. If `create_rc` is nonzero or `created_pr_output` is empty, malformed, or not one usable URL, perform one bounded exact repository/base/head `--state all` requery for diagnostic evidence only. The requery cannot prove which actor created a discovered PR, even under the local mutation lock. Do not close any PR from that evidence; return `BLOCKED` with `mutation_state=unknown` and all observed candidates. Never report success from unusable create output.
 
-If a newly created PR with a usable URL fails any postcondition, run `gh pr close "$created_pr_url" --repo "$repo_slug" --comment "Closed automatically after open-pr postcondition verification failed."` and re-query that exact PR. Use `mutation_state=reconciled` only when the close succeeds and the exact re-query succeeds with `state=CLOSED`; include a machine-readable `reconciliation` object containing the close result and closed provider identity. If close fails, re-query fails, or the exact PR remains open, return `BLOCKED` with `mutation_state=unknown` and the last observed identity. Never leave an identified unverified open PR or report success as though reconciliation completed. If a reused PR fails verification, leave it unchanged and return `BLOCKED` with `mutation_state=none` and its observed identity. A retry re-runs the exact open-PR query and reuses a valid exact match rather than creating another PR.
+If a newly created PR with a usable URL fails any postcondition, run `gh pr close "$created_pr_url" --repo "$repo_slug" --comment "Closed automatically after open-pr postcondition verification failed."` and re-query that exact PR. Use `mutation_state=reconciled` only when the close succeeds and the exact re-query succeeds with `state=CLOSED`; include a machine-readable `reconciliation` object containing the close result and closed provider identity. This reconciles the owned PR only; it does not undo the verified branch push. If close fails, re-query fails, or the exact PR remains open, return `BLOCKED` with `mutation_state=unknown` and the last observed identity. Never leave an identified unverified open PR or report success as though reconciliation completed. If a reused PR fails verification, leave it unchanged and return `BLOCKED` with `mutation_state=none` and its observed identity. A retry re-runs the exact open-PR query and reuses a valid exact match rather than creating another PR.
 
 Cleanup `writer_dir` only after the writer is terminal and both section handles
 (if admitted) are retired, on success and on every failure path. Writer failure

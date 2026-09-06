@@ -158,7 +158,7 @@ class Runtime:
         acted = [self.lock_script, self.admission, self.owner_script, self.worker, section,
                  self.path / "bin/agent-bash", self.path / "bin/agent-bash.toml", self.path / "bin/fixture-helper",
                  lock_path(self.repo).parent / "config"]
-        acted += [self.path / name for name in ("publication.py", "remove.py", "prepare.sh", "provider.json", "bin/gh")
+        acted += [self.path / name for name in ("publication.py", "effects.py", "remove.py", "prepare.sh", "provider.json", "transport.json", "bin/gh", "bin/git")
                   if (self.path / name).exists()]
         before = dict(command=[sys.executable, str(self.owner_script), str(self.admission)],
                       guide=str(GUIDE), guide_sha256=hashlib.sha256(GUIDE.read_bytes()).hexdigest(),
@@ -349,20 +349,110 @@ def test_unrelated_holder_survives_waiter_owner_exit(runtime):
     assert not (runtime.repo / "mutation").exists()
 
 
-GH = '''#!/usr/bin/env python3
-import json, os, pathlib, sys
-state = json.loads(pathlib.Path(os.environ["FAKE_PROVIDER"]).read_text())
+GH = r'''#!/usr/bin/env python3
+import json, os, pathlib, signal, socket, sys
+path = pathlib.Path(os.environ["FAKE_PROVIDER"])
+state = json.loads(path.read_text())
 args = sys.argv[1:]
+with open(str(path) + ".calls", "a") as output:
+    output.write(json.dumps(args) + "\n")
+mode = state.get("mode", "normal")
+
+def save():
+    path.write_text(json.dumps(state))
+
+def effect():
+    with open(os.environ["PUBLICATION_EFFECTS"], "a") as output:
+        output.write(json.dumps(dict(tool="gh", argv=args)) + "\n")
+
 if args[:2] == ["repo", "view"]:
-    assert args[2] == "fixture/project"
+    assert args == ["repo", "view", "fixture/project", "--json", "id,nameWithOwner,url"]
     print(json.dumps(state["repo"]))
 elif args[:2] == ["pr", "list"]:
-    with open(os.environ["FAKE_PROVIDER"] + ".queries", "a") as output:
-        output.write(json.dumps(args) + "\\n")
-    assert args == state["query"], "candidate query mismatch: " + repr(args)
+    with open(str(path) + ".queries", "a") as output:
+        output.write(json.dumps(args) + "\n")
+    expected = state["query"].copy()
+    if args[5] == "all":
+        expected[5] = "all"
+    assert args == expected, "candidate query mismatch: " + repr(args)
+    if args[5] == "all" and mode == "diagnostic-failed":
+        sys.exit(2)
     print(json.dumps(state["prs"]))
+elif args[:2] == ["pr", "create"]:
+    assert args == ["pr", "create", "--repo", "fixture/project", "--draft", "--head", "topic",
+                    "--base", "main", "--title", "Title", "--body-file", state["body_file"]]
+    assert pathlib.Path(state["body_file"]).read_text() == "Body"
+    state["prs"].append(state["new_pr"])
+    save()
+    effect()
+    if mode == "create-paused":
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        sock = socket.socket(socket.AF_UNIX)
+        sock.connect("\0" + state["barrier"][1:])
+        sock.sendall(str(os.getpid()).encode())
+        sock.recv(1)
+    url = state["new_pr"]["url"]
+    outputs = {"create-empty": "", "create-malformed": "created", "create-multiple": url + "\n" + url,
+               "create-foreign": "https://github.com/other/project/pull/1", "diagnostic-failed": ""}
+    print(outputs.get(mode, url))
+    sys.exit(1 if mode == "create-error" else 0)
+elif args[:2] == ["pr", "view"]:
+    assert args == ["pr", "view", state["new_pr"]["url"], "--repo", "fixture/project", "--json", state["query"][-1]]
+    state["views"] = state.get("views", 0) + 1
+    save()
+    row = json.loads(json.dumps(state["prs"][0]))
+    if mode == "view-failed" or (state["views"] > 1 and mode == "closed-read-failed"):
+        sys.exit(2)
+    if mode == "view-malformed":
+        print("not json")
+        sys.exit(0)
+    if mode.startswith("verify-"):
+        row.update(state["view_override"])
+    elif mode in ["close-error", "close-error-closed", "close-noeffect", "closed-read-failed", "closed-other", "normal-reconcile"] and state["views"] == 1:
+        row["headRefOid"] = "0" * 40
+    if state["views"] > 1 and mode == "closed-other":
+        row.update(url="https://github.com/fixture/project/pull/2", number=2)
+    print(json.dumps(row))
+elif args[:2] == ["pr", "close"]:
+    assert args == ["pr", "close", state["new_pr"]["url"], "--repo", "fixture/project", "--comment",
+                    "Closed automatically after open-pr postcondition verification failed."]
+    if mode not in ["close-error", "close-noeffect"]:
+        state["prs"][0]["state"] = "CLOSED"
+    save()
+    effect()
+    sys.exit(1 if mode in ["close-error", "close-error-closed"] else 0)
 else:
-    raise SystemExit("unexpected provider mutation: " + repr(args))
+    raise SystemExit("unexpected provider call: " + repr(args))
+'''
+
+GIT = r'''#!/usr/bin/env python3
+import json, os, pathlib, subprocess, sys
+args = sys.argv[1:]
+config = json.loads(pathlib.Path(os.environ["LOCAL_TRANSPORT"]).read_text())
+actual = args.copy()
+operation = args[2] if args[:1] == ["-C"] else args[0]
+if operation in ["push", "ls-remote"]:
+    position = 3
+    target = args[position]
+    with open(os.environ["LOCAL_TRANSPORT"] + ".calls", "a") as output:
+        output.write(json.dumps(dict(argv=args, target=target)) + "\n")
+    if target not in config["urls"]:
+        raise SystemExit("unmapped publication target: " + target)
+    actual[position] = config["urls"][target]
+result = subprocess.run([config["git"], *actual], text=True, capture_output=True, close_fds=False)
+if operation in ["push", "ls-remote"]:
+    with open(os.environ["LOCAL_TRANSPORT"] + ".results", "a") as output:
+        output.write(json.dumps(dict(argv=args, acted_argv=actual, rc=result.returncode,
+                                     stdout=result.stdout, stderr=result.stderr)) + "\n")
+if operation == "push":
+    with open(os.environ["PUBLICATION_EFFECTS"], "a") as output:
+        output.write(json.dumps(dict(tool="git", argv=args, rc=result.returncode)) + "\n")
+if operation == "ls-remote" and config.get("readback"):
+    print(config["readback"]["stdout"], end="")
+    sys.exit(config["readback"]["rc"])
+print(result.stdout, end="")
+print(result.stderr, end="", file=sys.stderr)
+sys.exit(result.returncode)
 '''
 
 
@@ -377,6 +467,7 @@ class Publication:
         self.worktrees = self.path / "worktrees"
         self.target = self.worktrees / "topic"
         git(self.repo, "worktree", "add", "-b", "topic", str(self.target))
+        git(self.target, "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m", "topic head")
         self.provider_path = self.path / "provider.json"
         self.provider = dict(repo=dict(id="repo-id", nameWithOwner="fixture/project",
                                       url="https://github.com/fixture/project"), prs=[],
@@ -392,6 +483,18 @@ class Publication:
         self.snapshot = self.path / "snapshot.json"
         self.output = self.path / "decision.json"
         self.effects = self.path / "publication-effects"
+        self.engine = self.path / "effects.py"
+        self.engine.write_text(block("worktree-publication-effects-v1"))
+        self.result = self.path / "publication-result.json"
+        self.other_remote = self.path / "other.git"
+        git(self.path, "init", "--bare", str(self.other_remote))
+        self.transport = self.path / "transport.json"
+        self.transport.write_text(json.dumps(dict(git=shutil.which("git"), urls={
+            "https://github.com/fixture/project.git": str(self.remote),
+            "https://github.com/fixture/other.git": str(self.other_remote)})))
+        boundary = self.path / "bin/git"
+        boundary.write_text(GIT)
+        boundary.chmod(0o700)
         self.writer_dir = self.path / "writer"
         self.writer_dir.mkdir()
         (self.writer_dir / "pr-body.md").write_text("Body")
@@ -399,7 +502,11 @@ class Publication:
         runtime.env.update(FAKE_PROVIDER=str(self.provider_path), publication_identity_script=str(self.guard),
                            snapshot=str(self.snapshot), worktrees_root=str(self.worktrees), name="topic",
                            branch_name="topic", base_branch="main", repo_slug="fixture/project",
-                           writer_dir=str(self.writer_dir), writer_rc="0", writer_log_rc="0")
+                           writer_dir=str(self.writer_dir), writer_rc="0", writer_log_rc="0",
+                           publication_effects_script=str(self.engine), publication_result_path=str(self.result),
+                           LOCAL_TRANSPORT=str(self.transport), PUBLICATION_EFFECTS=str(self.effects))
+        self.provider["body_file"] = str(self.writer_dir / "pr-body.md")
+        self.write_provider()
 
     def write_provider(self):
         self.provider_path.write_text(json.dumps(self.provider))
@@ -410,16 +517,28 @@ class Publication:
                 f'> "{self.output}"\n')
         _, job = self.runtime.start(body)
         assert "rc=0 " in self.runtime.terminal(job)
-        return json.loads(self.output.read_text())
+        result = json.loads(self.output.read_text())
+        self.provider["new_pr"] = self.exact_pr()
+        self.write_provider()
+        return result
+
+    def start_publish(self):
+        body = (block("worktree-writer-output-v1") + block("worktree-publication-functions-v1")
+                + block("worktree-publication-dispatch-v1"))
+        return self.runtime.start(body)
 
     def publish(self):
-        # Stub only external effects; actual published validation and dispatch select them.
-        body = block("worktree-writer-output-v1") + f'''
-publish_new_pr() {{ printf 'push\\ncreate\\n' >> "{self.effects}"; }}
-verify_reused_pr() {{ printf 'reuse\\n' >> "{self.effects}"; }}
-''' + block("worktree-publication-dispatch-v1")
-        _, job = self.runtime.start(body)
+        _, job = self.start_publish()
         return self.runtime.terminal(job)
+
+    def events(self):
+        return [json.loads(line) for line in self.effects.read_text().splitlines()] if self.effects.exists() else []
+
+    def observed(self):
+        return json.loads(self.result.read_text())
+
+    def calls(self):
+        return [json.loads(line) for line in Path(str(self.provider_path) + ".calls").read_text().splitlines()]
 
     def exact_pr(self):
         identity = json.loads(self.snapshot.read_text())
@@ -449,7 +568,7 @@ def test_writer_turn_is_unlocked_and_unchanged_tuple_publishes(publication, barr
         connection.sendall(b"0")
         writer.wait(timeout=DEADLINE)
         assert "rc=0 " in p.publish()
-        assert p.effects.read_text() == "push\ncreate\n"
+        assert_publication_transport(p)
         assert p.snapshot.read_bytes() == before
     finally:
         if writer.poll() is None:
@@ -533,7 +652,9 @@ def test_writer_boundary_provider_race_never_duplicates(publication, race):
     result = p.publish()
     if race == "exact":
         assert "rc=0 " in result
-        assert p.effects.read_text() == "reuse\n"
+        assert not p.effects.exists()
+        assert p.observed()["status"] == "VERIFIED"
+        assert p.calls()[-1][:3] == ["pr", "view", row["url"]]
     else:
         assert "rc=76 " in result
         assert not p.effects.exists()
@@ -774,3 +895,189 @@ def test_provider_oracle_rejects_wrong_candidate_query(publication, field):
     wrong[wrong.index("--" + field) + 1] = "unrelated"
     assert queries == [p.provider["query"], wrong]
     acquire_now(lock_path(p.repo))
+
+
+def assert_publication_transport(p):
+    identity = json.loads(p.snapshot.read_text())
+    events = p.events()
+    assert [event['tool'] for event in events] == ['git', 'gh']
+    assert events[0]['argv'] == ['-C', str(p.target), 'push', identity['push_url'],
+                                 identity['head_ref'] + ':' + identity['head_ref']]
+    assert events[0]['rc'] == 0
+    assert events[1]['argv'] == ['pr', 'create', '--repo', identity['repo_slug'], '--draft',
+                                 '--head', identity['branch'], '--base', identity['base_branch'],
+                                 '--title', 'Title', '--body-file', str(p.writer_dir / 'pr-body.md')]
+    assert git(p.remote, 'rev-parse', 'refs/heads/topic') == identity['head_sha']
+    assert git(p.remote, 'rev-parse', 'refs/heads/main') == identity['base_sha']
+    assert git(p.remote, 'for-each-ref', '--format=%(refname)') == 'refs/heads/main\nrefs/heads/topic'
+    assert git(p.other_remote, 'for-each-ref', '--format=%(refname)') == ''
+    readbacks = [json.loads(line) for line in Path(str(p.transport) + '.results').read_text().splitlines()]
+    assert readbacks[1]['argv'] == ['ls-remote', '--exit-code', '--refs', identity['push_url'], identity['head_ref']]
+    assert readbacks[1]['stdout'] == identity['head_sha'] + '\t' + identity['head_ref'] + '\n'
+    assert p.observed()['status'] == 'VERIFIED'
+    assert p.observed()['observed_identity'] == p.exact_pr()
+    assert p.calls()[-1] == ['pr', 'view', p.exact_pr()['url'], '--repo', identity['repo_slug'], '--json', p.provider['query'][-1]]
+
+
+def set_provider_mode(p, mode, **values):
+    p.provider.update(mode=mode, **values)
+    p.write_provider()
+
+
+def test_publication_ignores_ambient_target_and_ref_variables(publication):
+    p = publication
+    p.capture()
+    p.runtime.env.update(push_url='https://github.com/fixture/other.git', worktree_path=str(p.repo),
+                         base_sha='0' * 40, head_sha='0' * 40, head_ref='refs/heads/main')
+    assert 'rc=0 ' in p.publish()
+    assert_publication_transport(p)
+
+
+@pytest.mark.parametrize('intervention', ['target-url', 'destination-ref', 'source-ref'])
+def test_publication_transport_oracle_distinguishes_source_interventions(publication, intervention):
+    p = publication
+    p.capture()
+    old, new = {
+        'target-url': ('"push", identity["push_url"]', '"push", "https://github.com/fixture/other.git"'),
+        'destination-ref': ('identity["head_ref"] + ":" + identity["head_ref"]', 'identity["head_ref"] + ":refs/heads/other"'),
+        'source-ref': ('identity["head_ref"] + ":" + identity["head_ref"]', '"refs/heads/main:" + identity["head_ref"]'),
+    }[intervention]
+    original = p.engine.read_text()
+    assert original.count(old) == 1
+    (p.path / 'effects-original.py').write_text(original)
+    p.engine.write_text(original.replace(old, new))
+    (p.path / 'intervention.json').write_text(json.dumps(dict(
+        operation=intervention, original_sha256=hashlib.sha256(original.encode()).hexdigest(),
+        acted_sha256=hashlib.sha256(p.engine.read_bytes()).hexdigest(), replaced=old, replacement=new)))
+    result = p.publish()
+    assert 'rc=77 ' in result
+    assert p.observed()['reason'] == 'remote-head-unverified'
+    assert p.observed()['mutation_state'] == 'unknown'
+    assert not any(call[:2] == ['pr', 'create'] for call in p.calls())
+    with pytest.raises(AssertionError):
+        assert_publication_transport(p)
+    assert len(p.events()) == 1 and p.events()[0]['rc'] == 0
+    if intervention == 'target-url':
+        assert git(p.other_remote, 'rev-parse', 'topic') == p.exact_pr()['headRefOid']
+    elif intervention == 'destination-ref':
+        assert git(p.remote, 'rev-parse', 'other') == p.exact_pr()['headRefOid']
+    else:
+        assert git(p.remote, 'rev-parse', 'topic') == p.exact_pr()['baseRefOid']
+
+
+@pytest.mark.parametrize('readback', [dict(rc=2, stdout=''), dict(rc=0, stdout=''),
+                                    dict(rc=0, stdout='0' * 40 + '\trefs/heads/topic\n'),
+                                    dict(rc=0, stdout='malformed\n')])
+def test_remote_readback_failure_stops_before_provider_create(publication, readback):
+    p = publication
+    p.capture()
+    transport = json.loads(p.transport.read_text())
+    transport['readback'] = readback
+    p.transport.write_text(json.dumps(transport))
+    assert 'rc=77 ' in p.publish()
+    assert p.observed()['reason'] == 'remote-head-unverified'
+    assert p.observed()['mutation_state'] == 'unknown'
+    assert [event['tool'] for event in p.events()] == ['git']
+    assert git(p.remote, 'rev-parse', 'topic') == p.exact_pr()['headRefOid']
+
+
+@pytest.mark.parametrize('mode', ['create-empty', 'create-malformed', 'create-multiple', 'create-foreign',
+                                 'create-error', 'diagnostic-failed'])
+def test_unusable_create_output_never_owns_diagnostic_candidates(publication, mode):
+    p = publication
+    p.capture()
+    set_provider_mode(p, mode)
+    assert 'rc=77 ' in p.publish()
+    observed = p.observed()
+    assert observed['reason'] == 'create-outcome-unverified'
+    assert observed['mutation_state'] == 'unknown'
+    assert 'created_pr_url' not in observed
+    assert json.loads(p.provider_path.read_text())['prs'] == [p.exact_pr()]
+    expected = p.provider['query'].copy()
+    expected[5] = 'all'
+    assert p.calls()[-1] == expected
+    assert sum(call == expected for call in p.calls()) == 1
+    assert not any(call[:2] in [['pr', 'view'], ['pr', 'close']] for call in p.calls())
+    assert observed['diagnostic_candidates']['rc'] == (2 if mode == 'diagnostic-failed' else 0)
+
+
+@pytest.mark.parametrize('mode,mutation_state', [('normal-reconcile', 'reconciled'),
+                                                ('close-error', 'unknown'), ('close-error-closed', 'unknown'),
+                                                ('close-noeffect', 'unknown'), ('closed-read-failed', 'unknown'),
+                                                ('closed-other', 'unknown'), ('view-failed', 'unknown'),
+                                                ('view-malformed', 'unknown')])
+def test_created_pr_cleanup_requires_owned_close_and_exact_closed_readback(publication, mode, mutation_state):
+    p = publication
+    p.capture()
+    set_provider_mode(p, mode)
+    assert 'rc=77 ' in p.publish()
+    observed = p.observed()
+    assert observed['status'] == 'BLOCKED'
+    assert observed['reason'] == 'created-pr-postcondition-unverified'
+    assert observed['created_pr_url'] == p.exact_pr()['url']
+    assert observed['mutation_state'] == mutation_state
+    closes = [call for call in p.calls() if call[:2] == ['pr', 'close']]
+    assert len(closes) == 1 and closes[0][2] == observed['created_pr_url']
+    assert p.calls()[-1][:3] == ['pr', 'view', observed['created_pr_url']]
+    assert git(p.remote, 'rev-parse', 'topic') == p.exact_pr()['headRefOid']
+    if mutation_state == 'reconciled':
+        proof = observed['reconciliation']
+        assert proof['close_result']['rc'] == 0
+        assert proof['closed_provider_identity'] == dict(p.exact_pr(), state='CLOSED')
+        assert json.loads(p.provider_path.read_text())['prs'] == [dict(p.exact_pr(), state='CLOSED')]
+
+
+@pytest.mark.parametrize('field,value', [('url', 'https://github.com/other/project/pull/1'), ('number', 2),
+                                       ('state', 'CLOSED'), ('isDraft', False), ('baseRefName', 'other'),
+                                       ('baseRefOid', '0' * 40), ('headRefName', 'other'), ('headRefOid', '0' * 40),
+                                       ('headRepository', dict(nameWithOwner='other/project', name='project')),
+                                       ('headRepositoryOwner', dict(login='other'))])
+def test_reused_pr_readback_drift_never_closes_or_publishes(publication, field, value):
+    p = publication
+    p.capture()
+    p.provider['prs'] = [p.exact_pr()]
+    set_provider_mode(p, 'verify-' + field, view_override={field: value})
+    assert 'rc=77 ' in p.publish()
+    assert p.observed()['reason'] == 'reused-pr-postcondition-unverified'
+    assert p.observed()['mutation_state'] == 'none'
+    assert not p.effects.exists()
+    assert json.loads(p.provider_path.read_text())['prs'] == [p.exact_pr()]
+    assert p.calls()[-1][:3] == ['pr', 'view', p.exact_pr()['url']]
+
+
+def test_owner_exit_after_provider_effect_retains_unknown_journal(publication, barrier):
+    p = publication
+    p.capture()
+    set_provider_mode(p, 'create-paused', barrier=barrier.path)
+    owner, job = p.start_publish()
+    _, child = barrier.entered()
+    observed = p.observed()
+    assert observed['phase'] == 'create' and observed['mutation_state'] == 'unknown'
+    assert observed['in_flight'][:3] == ['gh', 'pr', 'create']
+    assert json.loads(p.provider_path.read_text())['prs'] == [p.exact_pr()]
+    with pytest.raises(BlockingIOError):
+        acquire_now(lock_path(p.repo))
+    owner.kill()
+    status = p.runtime.terminal(job)
+    assert 'reason=owner-exit' in status and 'rc=0 ' not in status
+    assert exited(child)
+    assert p.observed() == observed
+    assert p.observed()['status'] == 'IN_PROGRESS'
+    assert not any(call[:2] == ['pr', 'close'] for call in p.calls())
+    assert git(p.remote, 'rev-parse', 'topic') == p.exact_pr()['headRefOid']
+    acquire_now(lock_path(p.repo))
+
+
+@pytest.mark.parametrize('mode', ['view-failed', 'view-malformed'])
+def test_reused_pr_unreadable_verification_never_mutates_it(publication, mode):
+    p = publication
+    p.capture()
+    p.provider['prs'] = [p.exact_pr()]
+    set_provider_mode(p, mode)
+    assert 'rc=77 ' in p.publish()
+    assert p.observed()['reason'] == 'reused-pr-postcondition-unverified'
+    assert p.observed()['mutation_state'] == 'none'
+    assert p.observed()['observed_identity'] is None
+    assert not p.effects.exists()
+    assert json.loads(p.provider_path.read_text())['prs'] == [p.exact_pr()]
+    assert p.calls()[-1][:3] == ['pr', 'view', p.exact_pr()['url']]

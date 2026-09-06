@@ -9375,12 +9375,12 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     assert "reason=pr-writer-failed" in operator
     assert "reason=pr-writer-output-invalid" in operator
     assert "Do not execute any later command in this procedure" in operator
-    assert "created_pr_output=$(gh pr create" in operator
+    assert 'self.command("gh", "pr", "create"' in operator
     assert "perform one bounded exact repository/base/head" in operator
     assert "for diagnostic evidence only" in operator
     assert "Do not close any PR from that evidence" in operator
     assert "mutation_state=unknown" in operator
-    assert 'git ls-remote --exit-code --refs "$push_url"' in operator
+    assert 'self.command("git", "ls-remote", "--exit-code", "--refs", identity["push_url"]' in operator
     assert "BLOCKED:remote-head-unverified" in operator
     assert "whose OID equals `head_sha`" in operator
     assert "hold it through the exact open-PR decision only (section A)" in operator
@@ -9520,15 +9520,15 @@ def test_worktree_operator_sidecar_closes_mutation_boundary_and_results():
     non_exact_index = open_pr_section.index("BLOCKED:non-exact-open-pr")
     writer_index = open_pr_section.index("agents -a ~/ai/agents/pr-writer.md")
     push_index = open_pr_section.index(
-        'git -C "$worktree_path" push "$push_url"'
+        'self.command("git", "-C", identity["worktree_path"], "push", identity["push_url"]'
     )
     remote_head_index = open_pr_section.index(
-        'git ls-remote --exit-code --refs "$push_url"'
+        'self.command("git", "ls-remote", "--exit-code", "--refs", identity["push_url"]'
     )
     stale_identity_index = open_pr_section.index(
         "BLOCKED:stale-open-pr-worktree-identity"
     )
-    create_index = open_pr_section.index("created_pr_output=$(gh pr create")
+    create_index = open_pr_section.index('self.command("gh", "pr", "create"')
     assert lock_index < resolve_index < query_index < non_exact_index < writer_index
     assert stale_identity_index < push_index < create_index
     revalidate_index = open_pr_section.index("# worktree-publication-dispatch-v1")
