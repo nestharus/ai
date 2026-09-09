@@ -1564,7 +1564,11 @@ query($issueId: String!) {
         }
 
     def transition_issue(self, issue_id: str, target_status: str) -> dict[str, Any]:
-        """Perform a routine manager-owned status transition."""
+        """Acknowledge a routine target, or report an initially matching state.
+
+        initialState is from the initial issue read; resolvedTarget is from the
+        team catalog, not a post-update observation. No final read is performed.
+        """
         resolved = self.resolve_workflow_state_id_for_issue(issue_id, target_status)
         target_state_id = resolved.get("target_state_id")
         if not target_state_id:
@@ -1573,17 +1577,26 @@ query($issueId: String!) {
                 f"No workflow state ID resolved for issue: {issue_id}",
             )
 
+        outcome = "already_matching"
         if resolved.get("before_state_id") != target_state_id:
             self.update_issue(
                 issue_id=str(resolved["issue_id"]),
                 state_id=str(target_state_id),
             )
+            outcome = "acknowledged"
         return {
             "issue_id": resolved["issue_id"],
             "identifier": resolved["identifier"],
-            "beforeStatus": resolved["before_state_name"],
-            "afterStatus": resolved["target_state_name"],
-            "stateId": target_state_id,
+            "requestedStatus": target_status.strip(),
+            "initialState": {
+                "id": resolved["before_state_id"],
+                "name": resolved["before_state_name"],
+            },
+            "resolvedTarget": {
+                "id": target_state_id,
+                "name": resolved["target_state_name"],
+            },
+            "outcome": outcome,
         }
 
     def set_ticket_state(self, issue_uuid: str, state_id: str) -> dict[str, Any]:
