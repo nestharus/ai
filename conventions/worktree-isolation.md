@@ -1,6 +1,6 @@
 # Worktree Isolation
 
-**Unconditional rule**: every branch's work happens in its own git worktree, regardless of concurrency. The central checkout is read-only / branch-tracking only.
+**Unconditional rule**: every branch's work happens in its own git worktree, regardless of concurrency. The central checkout is for inspection and branch-tracking only, including the guarded default-branch deployment synchronization below—not authoring or feature work.
 
 ## Why
 
@@ -45,9 +45,17 @@ The central checkout may be inspected and kept aware of remote branch state. The
 13. `gh run list`
 14. File reads and searches that do not edit tracked files
 
-### Disallowed in the central checkout (state-mutating)
+### Default-branch deployment synchronization
 
-State-mutating work belongs in a git worktree. Do not use the central checkout for:
+When task authority permits deployment synchronization, a clean central checkout already on its configured default branch may run `git pull --ff-only <remote> <default-branch>` from that branch's configured remote. This advances the local branch and working tree to already merged remote default-branch content; it is branch-tracking/deployment synchronization, not authoring or feature mutation. Fetch alone updates remote-tracking state but does not deploy instructions into the local checkout.
+
+Before pulling, verify the repository's actual default branch, current branch, configured remote and upstream; the upstream must match that remote's default branch. Do not assume `main` (for example, ai uses `master`, while CRW uses `main`). Stop if any identity is missing, mismatched or uncertain; do not switch branches or reconfigure tracking to make the check pass. Verify a clean index and working tree, including no untracked work, and no operation in progress. Fetch and confirm that the local head is equal to or an ancestor of the remote default-branch head; local-only or divergent history stops synchronization.
+
+Use fast-forward-only behavior with rebasing and autostashing disabled, regardless of local Git configuration (for example, `git -c pull.rebase=false -c rebase.autoStash=false -c merge.autoStash=false pull --ff-only <remote> <default-branch>`). Dirty state, a non-fast-forward result, or any other failure stops the operation without automatic repair. Do not stash, reset, force, rebase, merge divergent history, resolve conflicts, or edit files in the central checkout. Afterward, read back the branch, head, upstream and clean status to confirm the intended synchronization; report any mismatch rather than repairing it. This exception grants no merge/review bypass or additional task authority.
+
+### Disallowed in the central checkout (authoring and other state mutation)
+
+Except for the guarded default-branch synchronization above and recognized topology carve-outs below, state-mutating work belongs in a git worktree. Do not use the central checkout for:
 
 1. `git checkout <branch>` or any feature-branch checkout
 2. `git switch <branch>`
@@ -57,10 +65,10 @@ State-mutating work belongs in a git worktree. Do not use the central checkout f
 6. `git rebase`
 7. `git cherry-pick`
 8. `git push`
-9. `git pull` on a non-default branch, or any pull that changes the central checkout working tree
+9. `git pull` except the guarded default-branch deployment synchronization above
 10. `git stash` used to manage central-checkout work
 11. `git add` or other staging operations
-12. Edits to tracked files or generated-file updates
+12. Authored edits to tracked files or generated-file updates (not updates delivered by the guarded synchronization above)
 13. Branch construction, feature implementation, experiments, fixes, or review revisions
 
 ## Recognized Carve-outs

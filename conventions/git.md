@@ -3,7 +3,7 @@
 ## Branches
 
 - All work happens on branches, never directly on `main`.
-- All branch work happens in a git worktree; the primary main checkout is read-only / branch-tracking only. See `~/ai/conventions/worktree-isolation.md`.
+- All branch work happens in a git worktree; the primary default-branch checkout is for inspection and branch-tracking only, including guarded clean fast-forward-only deployment synchronization under `~/ai/conventions/worktree-isolation.md`.
 - The primary `main` checkout stays clean.
 
 ### Naming
@@ -84,7 +84,7 @@ When a repository's PR list is visible to a public audience beyond the internal 
 ## Summary Rules
 
 - Work on branches, not `main`.
-- All branch work happens in a git worktree; the primary main checkout is read-only / branch-tracking only.
+- All branch work happens in a git worktree; the primary default-branch checkout is for inspection and branch-tracking only, including guarded clean fast-forward-only deployment synchronization under `~/ai/conventions/worktree-isolation.md`.
 - Keep `main` clean.
 - Sign commits with GPG.
 - Do not add agent authorship trailers.

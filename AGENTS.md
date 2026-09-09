@@ -432,7 +432,7 @@ agents -a ~/ai/agents/some-orchestrator.md -p /repo -f /tmp/prompt.md | head -3"
 
 Use [`/home/nes/projects/agent-runner/README.md`](/home/nes/projects/agent-runner/README.md) as the authoritative CLI reference for flags, named-agent resolution, config, and alternate invocation forms.
 
-All branch work runs in a git worktree; the central checkout is read-only / branch-tracking only; see [`~/ai/conventions/worktree-isolation.md`](conventions/worktree-isolation.md).
+All branch work runs in an isolated git worktree. Central-checkout branch-tracking includes authorized clean, fast-forward-only deployment synchronization of its configured default branch, not feature work; dirty or divergent states stop without repair. See [`~/ai/conventions/worktree-isolation.md`](conventions/worktree-isolation.md).
 
 ## Workflow Topologies
 
@@ -463,7 +463,7 @@ These are discoverability links, not default dispatch authority. The first three
 - [`~/ai/conventions/code-quality.md`](conventions/code-quality.md) - shared code-quality rules for function classification, max nesting depth, inline mini-function extraction, duplicate responsibility handling, and push-vs-pull system coupling
 - [`~/ai/conventions/design-patterns.md`](conventions/design-patterns.md) - shared design-pattern corpus consumed by workflow/agent design auditors
 - [`~/ai/conventions/git.md`](conventions/git.md) - branches, GPG, draft PR routine, no-attribution
-- [`~/ai/conventions/worktree-isolation.md`](conventions/worktree-isolation.md) - unconditional branch-work isolation and central-checkout read-state rule
+- [`~/ai/conventions/worktree-isolation.md`](conventions/worktree-isolation.md) - unconditional branch-work isolation and guarded central default-branch synchronization
 - [`~/ai/conventions/no-backwards-compatibility.md`](conventions/no-backwards-compatibility.md)
 - [`~/ai/conventions/no-deferred-stubs.md`](conventions/no-deferred-stubs.md)
 - [`~/ai/conventions/behavioral-proof.md`](conventions/behavioral-proof.md) - expected-versus-observed experiment evidence and review authority boundaries
