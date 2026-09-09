@@ -33,7 +33,7 @@ Ordinary observation needs concise source/result references sufficient to unders
 
 Process-only Markdown refinements do not by themselves select semantic product review or empirical evals. Changes to agent matching/recognition—what the agent recognizes, which role is selected, or which observations it can identify—warrant agent-design review even when written only in Markdown. Classify by changed capability, not extension; mixed changes retain the matching/recognition review requirement. Other protected changes still use this lifecycle. Explicitly selected empirical evaluations retain their own contracts; static document checks cannot establish agent efficacy.
 
-This proposed consumer policy cannot govern its own acceptance. Until it and the prerequisite observation protocol are properly landed, the pre-change governing lifecycle still controls this patch: root owns the immutable problem, exact implementation identity, independent claim/evidence and full `unscoped corrective` gates, final checks and delivery obligations. Draft preparation against a concurrent CRW candidate is not compatibility approval; root must recheck the actual landed interface before integration. Active runs and historical results retain their selected policy, without retrospective relabeling or implicit bypass.
+Protected changes follow the Mandatory General Landable-Change Lifecycle above. Active runs and historical results retain their selected policy, without retrospective relabeling or implicit bypass.
 
 ### Governed Emergency Disposition
 
