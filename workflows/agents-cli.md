@@ -10,7 +10,7 @@ workflow_dispatch_contract:
     - "standardizes agents CLI invocation and tee-based log capture for pipeline work"
     - "keeps complete invocation, optional session, provider payload, and result streams separate from canonical provider results and child-owned reports"
     - "routes delegated user questions through the root-owned question artifact convention"
-    - "requires branch work and tracked-file mutation to run from git worktrees; central checkout use is read-state / branch-tracking only"
+    - "requires branch work and authored tracked-file mutation to run from git worktrees; central branch-tracking permits only the guarded default-branch synchronization in conventions/worktree-isolation.md"
   outputs:
     - "consistent agents command shape for prompts, complete logs, distinct canonical outputs, and long-running background work"
     - "stable prompt and log naming conventions for post-run review"
@@ -45,7 +45,7 @@ root orchestrator or workflow operator invoking agents CLI
 - standardizes agents CLI invocation and tee-based log capture for pipeline work
 - keeps complete invocation, optional session, provider payload, and result streams separate from canonical provider results and child-owned reports
 - routes delegated user questions through the root-owned question artifact convention
-- requires branch work and tracked-file mutation to run from git worktrees; central checkout use is read-state / branch-tracking only
+- requires branch work and authored tracked-file mutation to run from git worktrees; central branch-tracking permits only the guarded default-branch synchronization in conventions/worktree-isolation.md
 
 ### Outputs
 
@@ -86,7 +86,7 @@ agents -a <agent.md> -p <worktree-path> -f <prompt-file> 2>&1 | python3 ~/ai/too
 
 - `-a <agent.md>`: path or named-agent reference; the `model:` value in the agent's frontmatter selects the model. **Do not** combine with `-m` — `-m` shadows the frontmatter and silently defeats any model rebalancing.
 - `-m <model>`: one of `gpt-high`, `gpt-xhigh`, `gpt-medium`, or another configured model id. Only used when there is no `-a`. See `~/ai/models/roles.md` for selection guidance.
-- `-p <worktree-path>`: the agent's working directory; for branch work or tracked-file mutation, this MUST be a git worktree per `~/ai/conventions/worktree-isolation.md`.
+- `-p <worktree-path>`: the agent's working directory; for branch work or authored tracked-file mutation, this MUST be a git worktree per `~/ai/conventions/worktree-isolation.md`.
 - `-f <prompt-file>`: the prompt as a Markdown file, usually in `.tmp/` or `.build/`.
 - `2>&1 | tee <log-path>`: capture the complete merged runner envelope into a dedicated `.log` file. A successful stream contains exactly one `OULIPOLY_INVOCATION`, exactly one optional `OULIPOLY_SESSION` immediately after it, provider payload, then exactly one terminal `OULIPOLY_RESULT`; it is never a canonical provider result/report path. The session envelope is optional because the production runner emits none when session resolution/capture returns `emitted=false`.
 - `2>&1 | secret_safe_capture.py capture ...`: the required capture form when the selected contract declares secrets. The helper validates `schema` and `secrets` before opening the log, replaces every non-empty declared environment value before writing to stdout or disk, and otherwise preserves the complete byte stream. Missing, blank, malformed, wrong-schema, non-list, duplicate, or invalid-name contract data is blocking and creates no new log.
@@ -134,10 +134,10 @@ The root orchestrator reads the artifact, presents the question and structured o
 
 ## Worktree Isolation
 
-Every branch-work or tracked-file-mutating agent runs in a worktree, regardless of concurrency. Read-state operations may inspect the central checkout; single-writer branch work must not use the main checkout.
+Every branch-work or authored-tracked-file-mutating agent runs in a worktree, regardless of concurrency. Read-state operations may inspect the central checkout; single-writer branch work must not use the main checkout.
 
-- Use one worktree per branch-work or tracked-file-mutating agent.
-- Read-state agents can inspect the central checkout without tracked-file edits.
+- Use one worktree per branch-work or authored-tracked-file-mutating agent.
+- Read-state agents can inspect the central checkout without tracked-file edits. Authorized default-branch deployment synchronization is a separate branch-tracking operation, allowed only under the guarded exception in the isolation convention; it is not authoring or feature work.
 - See `~/ai/conventions/worktree-isolation.md` for the rule, central-checkout limits, and setup.
 
 ## Long-running agents

@@ -9,7 +9,7 @@ expectations:
 - standardizes agents CLI invocation and tee-based log capture for pipeline work
 - keeps complete invocation, optional session, provider payload, and result streams separate from canonical provider results and child-owned reports
 - routes delegated user questions through the root-owned question artifact convention
-- requires branch work and tracked-file mutation to run from git worktrees; central checkout use is read-state / branch-tracking only
+- requires branch work and authored tracked-file mutation to run from git worktrees; central branch-tracking permits only the guarded default-branch synchronization in conventions/worktree-isolation.md
 outputs:
 - consistent agents command shape for prompts, complete logs, distinct canonical outputs, and long-running background work
 - stable prompt and log naming conventions for post-run review
