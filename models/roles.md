@@ -11,6 +11,10 @@ Do not restate the matrix there.
 - **`gpt-medium`** is the fast automation route for bounded, structured operator loops.
 - Legacy provider-specific model ids are deprecated for shared routing. Do not add new provider-specific assignments to operational docs; update the operator frontmatter and this matrix instead.
 
+## Code Review Workflows observation roles
+
+For CRW ordinary observation, its current authoritative semantic contract is the narrower exception to the generic matrix and research split below: every reviewer, investigative coordinator, cross-examiner and definition reviewer requests opaque `gpt-xhigh`. Do not lower the route for an easy invocation or use a ticket-operation alias for review. Do not resolve or attest provider/model/effort settings. This does not change ticket/operational worker routes or make legacy review gates the default shared delivery workflow.
+
 ## Matrix
 
 | Model | Role | Use for |

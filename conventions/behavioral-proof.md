@@ -6,6 +6,10 @@ This convention is the repository authority for behavioral-proof vocabulary and
 for the boundary between executing an experiment and reviewing its plan or
 evidence.
 
+## Ordinary observation boundary
+
+Under the [shared delivery lifecycle](../AGENTS.md#mandatory-general-landable-change-lifecycle), ordinary CRW observation may use source locations, excerpts and existing result references without immutable execution records, custody packages or identity attestations. Report what those materials support and leave provenance gaps explicit; do not reject investigation merely because a record format is absent. The stricter experiment-proof requirements below apply when claiming behavioral proof, not as admission conditions on every observation. Source reasoning, proposed checks and static document checks do not establish runtime behavior or stochastic agent efficacy.
+
 ## Canonical Rule
 
 Behavioral proof is the recorded comparison between the expected result of a

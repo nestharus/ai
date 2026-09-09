@@ -4,6 +4,14 @@ A project's `AGENTS.md` maps user cues to workflows.
 
 This doc defines the routing rules for that table.
 
+## Shared delivery precedence
+
+[`~/ai/AGENTS.md`](../AGENTS.md#mandatory-general-landable-change-lifecycle) owns the shared landable-change lifecycle: observe → interpret against purpose/environment → decide across choices → correction/solution search → observe consequences. This overrides conflicting default pipeline routes in manager/flavor operators, their sidecars and older feature/refactoring conventions. Those legacy delivery orchestrators require explicit selection; their gates never substitute for consumer-owned decisions, verification or external authority. Specialized operational triggers below still apply, but resulting protected changes return to the shared lifecycle.
+
+Review observations are evidence, not recommendations or automatic fix mandates. The consumer considers all decisions and their interactions, accepted/no-action observations and unresolved consequential user questions. Only the latter prevent affected completion merely by remaining unresolved; preserve evidence and uncertainty in either case. Do not turn decision-making into specification generation or impose a fixed review cohort.
+
+Process-only Markdown edits do not automatically select semantic review/evals; changes to agent matching/recognition warrant agent-design review, including mixed edits. Follow the transition boundary in AGENTS.md: a proposed rule cannot waive the currently governing acceptance process for itself.
+
 ## Shape
 
 Project `AGENTS.md` includes a cue-to-workflow routing table near
