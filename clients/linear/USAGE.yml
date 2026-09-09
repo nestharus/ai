@@ -34,7 +34,13 @@ linear_client_usage:
       PYTHONPATH=$HOME/ai python3 -m clients.linear.cli update-issue
       ACR-122 --estimate 13
     transition_issue:
-      description: "Manager-owned routine status transition for a Linear issue."
+      description: "Acknowledgement-only routine transition; no final state read."
+      result:
+        requestedStatus: "Normalized caller request"
+        initialState: "{id, name} from initial issue read"
+        resolvedTarget: "{id, name} from owning team state catalog, not observed final state"
+        outcome: "acknowledged (literal mutation success:true) or already_matching (initial ID matched; no mutation)"
+      explicit_readback: "After ok:true, run get-issue with data.issue_id. Report its actual data.state separately as a point-in-time observation and compare its ID to resolvedTarget.id. Missing ID, mismatch or read error does not verify the target; retain transition outcome, do not retry or overwrite. Even a match is not a durable guarantee."
       example: >-
         PYTHONPATH=$HOME/ai python3 -m clients.linear.cli transition-issue
         ACR-130 --target-status "In Progress"

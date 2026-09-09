@@ -319,7 +319,7 @@ def update_issue(
 
 
 def transition_issue(issue_id: str, target_status: str) -> None:
-    """Transition an issue to a routine manager-owned status."""
+    """Print target acknowledgement or initial match, without a final state read."""
     client = LinearClient()
     result = client.transition_issue(
         issue_id=issue_id,
@@ -597,7 +597,7 @@ def main(argv: list[str] | None = None) -> None:
     # transition-issue command
     transition_issue_parser = subparsers.add_parser(
         "transition-issue",
-        help="Transition an issue to a routine manager-owned status",
+        help="Acknowledge a routine target or initial match (no final state read)",
     )
     transition_issue_parser.add_argument("issue_id", help="Issue ID (e.g., ACR-130)")
     transition_issue_parser.add_argument(

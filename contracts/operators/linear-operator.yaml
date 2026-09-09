@@ -131,7 +131,7 @@ outputs:
   success_shape: Task-specific stdout or durable artifact paths named by the procedure.
   wrote_lines: []
 - task: transition
-  success_shape: Task-specific stdout or durable artifact paths named by the procedure.
+  success_shape: Initial observation, requested status, resolved target, and acknowledged or already_matching outcome; no final-state claim. Explicitly required readback uses get-issue and reports a separate point-in-time match; mismatch, unverifiable state, or read error is BLOCKED with transition outcome retained.
   wrote_lines: []
 - task: search
   success_shape: Task-specific stdout or durable artifact paths named by the procedure.

@@ -349,6 +349,8 @@ For Linear filing, the route is `(team, project?, labels[])`: pass `--team <team
 
 Use the selected `${ticket_operator}` with `task=transition`: `~/ai/agents/jira-operator.md` for JIRA and `~/ai/agents/linear-operator.md` for Linear. JIRA resolves transition IDs through the Jira workflow; Linear resolves `target_status` against the issue team's workflow states before calling `issueUpdate(stateId)`. The manager-owned routine states are `Todo`, `In Progress`, and `Done`; the dispatch-time "Todo -> In Progress" rule applies to both backends. Do not transition in ways that contradict the orchestrator's actual run state.
 
+For Linear, retain the operator's `acknowledged` or `already_matching` outcome as operation evidence, not verified final tracker state. If the task requires verified state, request the operator's explicit point-in-time readback; never substitute the resolved target for backend observation.
+
 ### GitHub auto-transition
 
 Linear has a workspace-level GitHub integration. When `ticket_system=linear`, Phase 9 passes `${ticket_id}` to `pr-writer` as `linear_issue_keys`, and the PR body may include Linear close-keyword footers for that key. JIRA omits PR-body close-keyword footers by default. Manual post-merge comments or transitions remain appropriate when the footer was omitted, the PR did not reach the relevant default branch, or automation did not actually complete.

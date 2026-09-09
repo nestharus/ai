@@ -138,7 +138,7 @@ outputs:
     success_shape: "Task-specific stdout or durable artifact paths named by the procedure."
     wrote_lines: []
   - task: transition
-    success_shape: "Task-specific stdout or durable artifact paths named by the procedure."
+    success_shape: "Initial observation, requested status, resolved target, and acknowledged or already_matching outcome; no final-state claim. Explicitly required readback uses get-issue and reports a separate point-in-time match; mismatch, unverifiable state, or read error is BLOCKED with transition outcome retained."
     wrote_lines: []
   - task: search
     success_shape: "Task-specific stdout or durable artifact paths named by the procedure."
@@ -203,7 +203,7 @@ You read, comment on, create, and transition Linear issues using the ported Line
 
 These execution instructions apply to you in the current invocation, including when a selected project wrapper inherits this procedure: you are already its terminal executor, and reading the base procedure does not make you a caller requiring another dispatch.
 
-The task mapping is closed: `read` uses `get-issue`; `comment` uses `create-comment`; `create` uses `search-issues` followed by at most one `create-issue`; `update-estimate` first applies the selected-contract admission in Procedure: Update Estimate, then uses `update-issue` and the documented comment path only when admitted; `transition` uses `transition-issue`; `search` uses `search-issues`; `list-issues` uses `list-issues`; `list-projects` uses `list-projects`; `list-labels` uses `list-labels`; `create-label` uses `create-label`; `apply-labels` uses `apply-labels`; and `upsert-comment` uses `upsert-comment`. Return success only after the admitted direct operation and required readback are terminal.
+The task mapping is closed: `read` uses `get-issue`; `comment` uses `create-comment`; `create` uses `search-issues` followed by at most one `create-issue`; `update-estimate` first applies the selected-contract admission in Procedure: Update Estimate, then uses `update-issue` and the documented comment path only when admitted; `transition` uses `transition-issue` (and `get-issue` only for explicitly required readback); `search` uses `search-issues`; `list-issues` uses `list-issues`; `list-projects` uses `list-projects`; `list-labels` uses `list-labels`; `create-label` uses `create-label`; `apply-labels` uses `apply-labels`; and `upsert-comment` uses `upsert-comment`. Return success only after the admitted direct operation and required readback are terminal.
 
 ## Required Inputs
 
@@ -533,7 +533,17 @@ PYTHONPATH=$HOME/ai python3 -m clients.linear.cli transition-issue "ACR-130" --t
 
 ACR-126 does not expand this routine transition contract; P4 original-ticket disposition may use only these same `Todo`, `In Progress`, or `Done` targets when the approved disposition requires a routine Linear status.
 
-The CLI reads the issue, uses `issue.team.id`, lists that team's workflow states, exact-match checks `target_status`, and calls `issueUpdate` with `stateId`. Print `before-status -> after-status`.
+The CLI reads the issue, uses `issue.team.id`, lists that team's workflow states, exact-match checks `target_status`, and calls `issueUpdate` with `stateId` only if the initial state ID differs. Its `ok:true` means the routine operation succeeded, not that final state was verified. Report the returned evidence separately:
+
+- `requestedStatus`: the normalized caller request.
+- `resolvedTarget`: `{id, name}` from the owning team's state catalog, not an issue-state observation.
+- `initialState`: `{id, name}` observed in the initial issue read (possibly null fields).
+- `outcome=acknowledged`: the mutation returned literal `success:true`; no post-update state was read.
+- `outcome=already_matching`: the initial state ID matched the target; no mutation was sent or acknowledged.
+
+Print `KEY initial observation: NAME (ID); requested: STATUS; resolved target: NAME (ID); outcome: OUTCOME; post-read: not performed`. Never present the target as an observed after-state. Default operation requires no extra read. False or malformed acknowledgements remain errors, not success.
+
+When the caller explicitly requires state readback, after successful transition run the existing `get-issue` command with the returned `issue_id` (not a potentially moved identifier). Report that read's `data.state.id` and `data.state.name` separately as a **point-in-time readback**, comparing the observed ID to `resolvedTarget.id`. Only an actual matching ID supports readback match; missing state/ID is unverifiable. On mismatch, missing state, or read failure, retain the transition outcome but return `BLOCKED` for the requested verified-readback task, disclosing the observed result or error. Do not infer the target, automatically retry, or overwrite concurrent changes. Even a matching read does not guarantee durable state. No readback is implied by acknowledgement or initial match.
 
 Workflow states are per-team. Never hard-code state IDs or reuse a state ID observed on another team. If there is an unreadable issue, `$LINEAR_API_KEY` is missing, `target_status` is out-of-contract, or the target state is unknown or ambiguous, return `BLOCKED`.
 
@@ -569,7 +579,7 @@ For `list-projects`: print one line per result (`ID  state  name`, omitting blan
 For `list-labels`: print one line per result (`ID  name`).
 For `create-label`: print the new label ID + name.
 For `apply-labels`: print the issue key + applied label names.
-For `transition`: print before-status -> after-status.
+For `transition`: print the initial observation, requested status, resolved target and `acknowledged` or `already_matching` outcome per Procedure: Transition; disclose whether a post-read was performed. Explicit readback results are separate point-in-time observations, never target-derived after-status.
 For `search`: print one line per result (`KEY  state  title`).
 
 ## Stop Conditions
